@@ -1,7 +1,9 @@
+// src/lib/api.ts
 import {
   ArchitectRecommendationResponse,
   ProjectIR,
-  ScaffoldManifest,
+  ScaffoldJobStatus,
+  TargetFrontend,
   TargetLanguage,
   TechnicalConstraints,
 } from "@/types/ir";
@@ -15,20 +17,6 @@ export async function analyzeInputs(payload: {
   plain_text_requirements?: string;
 }): Promise<ProjectIR> {
   const res = await fetch(`${API_BASE}/ingestion/analyze`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) throw new Error(await res.text());
-  return res.json();
-}
-
-export async function scanLocalDirectory(payload: {
-  project_name: string;
-  directory_path: string;
-  plain_text_requirements?: string;
-}): Promise<ProjectIR> {
-  const res = await fetch(`${API_BASE}/ingestion/scan-directory`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -58,6 +46,7 @@ export async function recommendStack(
   project_ir: ProjectIR,
   constraints: TechnicalConstraints,
   override_language?: TargetLanguage | null,
+  override_frontend?: TargetFrontend | null,
 ): Promise<ArchitectRecommendationResponse> {
   const res = await fetch(`${API_BASE}/architect/recommend-stack`, {
     method: "POST",
@@ -66,16 +55,17 @@ export async function recommendStack(
       project_ir,
       constraints,
       override_language: override_language || null,
+      override_frontend: override_frontend || null,
     }),
   });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
 
-export async function previewScaffold(
+export async function startScaffoldJob(
   project_ir: ProjectIR,
-): Promise<ScaffoldManifest> {
-  const res = await fetch(`${API_BASE}/scaffolder/preview`, {
+): Promise<ScaffoldJobStatus> {
+  const res = await fetch(`${API_BASE}/scaffolder/start-job`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(project_ir),
@@ -84,24 +74,15 @@ export async function previewScaffold(
   return res.json();
 }
 
-export async function downloadScaffoldZip(
-  project_ir: ProjectIR,
-): Promise<void> {
-  const res = await fetch(`${API_BASE}/scaffolder/download-zip`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(project_ir),
-  });
+export async function pollScaffoldJob(
+  jobId: string,
+): Promise<ScaffoldJobStatus> {
+  const res = await fetch(`${API_BASE}/scaffolder/jobs/${jobId}`);
   if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
 
-  const blob = await res.blob();
-  const url = window.URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  const slug = project_ir.project_name.toLowerCase().replace(/\s+/g, "_");
-  link.setAttribute("download", `${slug}_kickstarter.zip`);
-  document.body.appendChild(link);
-  link.click();
-  link.remove();
-  window.URL.revokeObjectURL(url);
+export function triggerInstantJobZipDownload(jobId: string): void {
+  // Hits the pre-built in-memory ZIP endpoint directly for an instant browser download
+  window.location.href = `${API_BASE}/scaffolder/jobs/${jobId}/download`;
 }

@@ -1,30 +1,47 @@
 # app/services/scaffolder/engine.py
 import io
 import json
+import os
+import shutil
+import subprocess
+import tempfile
 import zipfile
-from typing import List
+from pathlib import Path
+from typing import Callable, List, Optional
 from pydantic import BaseModel, Field
 
 from app.domain.ir_schema import (
     DataTypePrimitive,
     EntityDefinition,
     ProjectIR,
+    TargetFrontend,
     TargetLanguage,
 )
 from app.services.strangler.test_generator import strangler_generator
+
+IGNORE_DIRS = {
+    "node_modules",
+    ".git",
+    ".next",
+    "dist",
+    "build",
+    "target",
+    "bin",
+    "obj",
+    "__pycache__",
+    ".venv",
+    "venv",
+}
+
+IGNORE_EXTENSIONS = {".pyc", ".exe", ".dll", ".so", ".dylib", ".lock"}
 
 
 class GeneratedFile(BaseModel):
     path: str = Field(
         ..., description="Relative file path inside the Kick-Starter repo"
     )
-    language: str = Field(
-        ..., description="Syntax highlighting hint, e.g., python, go, typescript"
-    )
-    category: str = Field(
-        ...,
-        description="infrastructure | domain | application | adapter | frontend-ui | frontend-data | tests | docs",
-    )
+    language: str = Field(..., description="Syntax highlighting hint")
+    category: str = Field(..., description="File architectural layer")
     content: str
 
 
@@ -32,276 +49,398 @@ class ScaffoldManifest(BaseModel):
     project_id: str
     project_name: str
     chosen_stack: TargetLanguage
+    chosen_frontend: TargetFrontend
     chosen_pattern: str
+    cli_commands_executed: List[str] = Field(default_factory=list)
     total_files_generated: int
     files: List[GeneratedFile]
 
 
+ProgressCallback = Callable[[str, int], None]
+
+
 class ScaffolderEngine:
     """
-    Phase 4 Deterministic Scaffolding Engine.
-    Transforms a validated ProjectIR into a containerized, full-stack,
-    componentized Kick-Starter monorepo (`backend/` + `frontend/`).
+    Phase 4 CLI-Driven Scaffolding Engine.
+    1. Runs official language/framework CLI initializers in a temporary workspace
+       (with --skip-install so configs are always up-to-date without downloading GBs of packages).
+    2. Layers REGEN's Hexagonal/Clean Architecture & Componentized Domain UI on top.
+    3. Strips ignored directories (.git, node_modules, bin, target) like GitHub.
+    4. Packages both a browsable ScaffoldManifest and a pre-built ZIP byte stream.
     """
 
-    def generate_manifest(self, ir: ProjectIR) -> ScaffoldManifest:
+    def build_project_and_zip(
+        self,
+        ir: ProjectIR,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> tuple[ScaffoldManifest, bytes]:
         if not ir.is_ready_for_scaffolding or ir.architecture_decision is None:
             raise ValueError(
                 "ProjectIR is not ready for scaffolding. Resolve all HITL questions "
                 "and run the Stack Advisor first."
             )
 
-        # Ensure Phase 5 characterization tests are populated
+        def report(step_msg: str, pct: int) -> None:
+            if on_progress:
+                on_progress(step_msg, pct)
+
+        report("Generating Phase 5 Strangler Fig characterization contracts...", 10)
         strangler_generator.populate_contracts(ir)
 
-        stack = ir.architecture_decision.chosen_backend_language
-        pattern = ir.architecture_decision.chosen_pattern.value
-        include_frontend = (
-            ir.technical_constraints.require_frontend
-            or ir.architecture_decision.chosen_frontend_stack is not None
-        )
+        arch = ir.architecture_decision
+        backend_stack = arch.chosen_backend_language
+        frontend_stack = arch.chosen_frontend_stack
+        pattern = arch.chosen_pattern.value
+        cli_log: List[str] = []
 
-        files: List[GeneratedFile] = []
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            slug = ir.project_name.lower().replace(" ", "_")
+            root_dir = Path(tmp_dir) / slug
+            root_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. Root Container-First Infrastructure (docker-compose.yml, Makefile, Dockerfiles)
-        files.extend(self._generate_infrastructure_files(ir, stack, include_frontend))
+            backend_dir = root_dir / "backend"
+            backend_dir.mkdir(parents=True, exist_ok=True)
 
-        # 2. Root AI-Friendliness Documentation (AGENTS.md + Blueprint IR snapshot)
-        files.extend(self._generate_ai_documentation_files(ir, include_frontend))
-
-        # 3. Backend Stack (Scoped cleanly inside `backend/`)
-        if stack == TargetLanguage.GO_FIBER_OR_CHI:
-            files.extend(self._generate_go_hexagonal_stack(ir))
-        elif stack == TargetLanguage.TYPESCRIPT_NEST_OR_NODE:
-            files.extend(self._generate_ts_hexagonal_stack(ir))
-        else:
-            files.extend(self._generate_python_hexagonal_stack(ir))
-
-        # 4. Frontend Stack (Scoped inside `frontend/` with strict componentization)
-        if include_frontend:
-            files.extend(self._generate_componentized_nextjs_frontend(ir))
-
-        # 5. Phase 5: Strangler Fig Characterization Test Suite
-        files.append(
-            GeneratedFile(
-                path="backend/tests/test_strangler_parity.py",
-                language="python",
-                category="tests",
-                content=strangler_generator.render_parity_test_file(ir),
+            # ----------------------------------------------------------------
+            # STEP 1: Run Official Backend CLI Initializer
+            # ----------------------------------------------------------------
+            report(
+                f"Initializing backend project via `{backend_stack.value}` CLI...", 25
             )
-        )
+            self._init_backend_via_cli(backend_dir, slug, backend_stack, cli_log)
 
-        return ScaffoldManifest(
-            project_id=ir.project_id,
-            project_name=ir.project_name,
-            chosen_stack=stack,
-            chosen_pattern=pattern,
-            total_files_generated=len(files),
-            files=files,
-        )
+            # ----------------------------------------------------------------
+            # STEP 2: Overlay Hexagonal / Clean Backend Architecture from IR
+            # ----------------------------------------------------------------
+            report(f"Layering {pattern} domain entities, ports, and HITL rules...", 45)
+            self._overlay_backend_architecture(backend_dir, ir, backend_stack)
+
+            # ----------------------------------------------------------------
+            # STEP 3: Run Official Frontend CLI Initializer (if enabled)
+            # ----------------------------------------------------------------
+            if frontend_stack != TargetFrontend.NONE:
+                report(
+                    f"Bootstrapping frontend via official `{frontend_stack.value}` CLI...",
+                    65,
+                )
+                self._init_frontend_via_cli(root_dir, slug, frontend_stack, cli_log)
+
+                report(
+                    f"Injecting componentized domain UI & typed API client into `{frontend_stack.value}`...",
+                    80,
+                )
+                self._overlay_frontend_architecture(
+                    root_dir / "frontend", ir, frontend_stack
+                )
+
+            # ----------------------------------------------------------------
+            # STEP 4: Write Root Container Infrastructure & AI Documentation
+            # ----------------------------------------------------------------
+            report(
+                "Generating Docker Compose, Makefile, AGENTS.md, and Parity Tests...",
+                90,
+            )
+            self._write_root_infrastructure_and_docs(
+                root_dir, ir, backend_stack, frontend_stack, cli_log
+            )
+
+            # ----------------------------------------------------------------
+            # STEP 5: Prune Ignored Folders (node_modules, .git, bin, obj) & Pack ZIP
+            # ----------------------------------------------------------------
+            report("Pruning build artifacts and compressing ZIP archive...", 95)
+            self._prune_ignored_directories(root_dir)
+            manifest, zip_bytes = self._package_workspace(
+                root_dir, ir, backend_stack, frontend_stack, pattern, cli_log
+            )
+
+        report("Kick-Starter ZIP archive ready for instant download!", 100)
+        return manifest, zip_bytes
+
+    def generate_manifest(self, ir: ProjectIR) -> ScaffoldManifest:
+        manifest, _ = self.build_project_and_zip(ir)
+        return manifest
 
     def build_zip_archive(self, ir: ProjectIR) -> bytes:
-        """Packages all generated Kick-Starter files into an in-memory .zip archive."""
-        manifest = self.generate_manifest(ir)
-        buffer = io.BytesIO()
-        root_folder = ir.project_name.lower().replace(" ", "_")
-
-        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for gen_file in manifest.files:
-                zf.writestr(f"{root_folder}/{gen_file.path}", gen_file.content)
-
-        buffer.seek(0)
-        return buffer.getvalue()
+        _, zip_bytes = self.build_project_and_zip(ir)
+        return zip_bytes
 
     # ========================================================================
-    # 1. INFRASTRUCTURE & AI-FRIENDLINESS TEMPLATES
+    # CLI EXECUTION HELPER (SAFE, NON-INTERACTIVE, TIMEOUT-BOUNDED)
     # ========================================================================
 
-    def _generate_infrastructure_files(
-        self, ir: ProjectIR, stack: TargetLanguage, include_frontend: bool
-    ) -> List[GeneratedFile]:
+    def _run_cli(
+        self, cmd: List[str], cwd: Path, cli_log: List[str], timeout_sec: int = 45
+    ) -> bool:
+        """
+        Executes a native CLI command cross-platform (Windows/Linux/macOS).
+        Uses CI=true to prevent interactive prompts.
+        """
+        cmd_str = " ".join(cmd)
+        env = {**os.environ, "CI": "true", "NEXT_TELEMETRY_DISABLED": "1"}
+        use_shell = (
+            os.name == "nt"
+        )  # Needed on Windows to resolve .cmd shims like npx.cmd / npm.cmd
+        try:
+            proc = subprocess.run(
+                cmd_str if use_shell else cmd,
+                cwd=str(cwd),
+                env=env,
+                shell=use_shell,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                check=False,
+            )
+            if proc.returncode == 0:
+                cli_log.append(f"[OK] {cmd_str}")
+                return True
+            cli_log.append(
+                f"[WARN: exit {proc.returncode}] {cmd_str} -> {(proc.stderr or proc.stdout)[:160].strip()}"
+            )
+            return False
+        except Exception as exc:
+            cli_log.append(f"[SKIPPED - CLI not on PATH] {cmd_str} ({exc})")
+            return False
+
+    # ========================================================================
+    # BACKEND CLI INITIALIZERS + HEXAGONAL OVERLAY
+    # ========================================================================
+
+    def _init_backend_via_cli(
+        self,
+        backend_dir: Path,
+        slug: str,
+        stack: TargetLanguage,
+        cli_log: List[str],
+    ) -> None:
         if stack == TargetLanguage.GO_FIBER_OR_CHI:
-            backend_dockerfile = (
-                "FROM golang:1.23-alpine AS builder\n"
-                "WORKDIR /app\n"
-                "COPY . .\n"
-                "RUN go mod init kickstarter || true && go build -o server ./cmd/api/main.go\n\n"
-                "FROM alpine:3.20\n"
-                "WORKDIR /app\n"
-                "COPY --from=builder /app/server .\n"
-                "EXPOSE 8000\n"
-                'CMD ["./server"]\n'
-            )
-        elif stack == TargetLanguage.TYPESCRIPT_NEST_OR_NODE:
-            backend_dockerfile = (
-                "FROM node:22-alpine\n"
-                "WORKDIR /app\n"
-                "COPY package.json .\n"
-                "RUN npm install\n"
-                "COPY . .\n"
-                "EXPOSE 8000\n"
-                'CMD ["npm", "start"]\n'
-            )
-        else:
-            backend_dockerfile = (
-                "FROM python:3.13-slim\n"
-                "WORKDIR /app\n"
-                "COPY requirements.txt .\n"
-                "RUN pip install --no-cache-dir -r requirements.txt\n"
-                "COPY . .\n"
-                "EXPOSE 8000\n"
-                'CMD ["uvicorn", "src.adapters.api.main:app", "--host", "0.0.0.0", "--port", "8000"]\n'
-            )
-
-        frontend_service_yaml = ""
-        if include_frontend:
-            frontend_service_yaml = (
-                "  frontend:\n"
-                "    build: ./frontend\n"
-                "    ports:\n"
-                '      - "3000:3000"\n'
-                "    environment:\n"
-                "      - NEXT_PUBLIC_API_URL=http://localhost:8000\n"
-                "    depends_on:\n"
-                "      - backend\n\n"
-            )
-
-        compose = (
-            "services:\n"
-            "  backend:\n"
-            "    build: ./backend\n"
-            "    ports:\n"
-            '      - "8000:8000"\n'
-            "    environment:\n"
-            "      - DATABASE_URL=postgresql://postgres:postgres@db:5432/kickstarter\n"
-            "    depends_on:\n"
-            "      db:\n"
-            "        condition: service_healthy\n\n"
-            f"{frontend_service_yaml}"
-            "  db:\n"
-            "    image: postgres:16-alpine\n"
-            "    environment:\n"
-            "      - POSTGRES_USER=postgres\n"
-            "      - POSTGRES_PASSWORD=postgres\n"
-            "      - POSTGRES_DB=kickstarter\n"
-            "    ports:\n"
-            '      - "5432:5432"\n'
-            "    healthcheck:\n"
-            '      test: ["CMD-SHELL", "pg_isready -U postgres"]\n'
-            "      interval: 5s\n"
-            "      timeout: 5s\n"
-            "      retries: 5\n"
-        )
-
-        makefile = (
-            ".PHONY: up down test\n\n"
-            "up:\n"
-            "\tdocker compose up --build -d\n\n"
-            "down:\n"
-            "\tdocker compose down\n\n"
-            "test:\n"
-            "\tpytest backend/tests/\n"
-        )
-
-        infra_files = [
-            GeneratedFile(
-                path="backend/Dockerfile",
-                language="dockerfile",
-                category="infrastructure",
-                content=backend_dockerfile,
-            ),
-            GeneratedFile(
-                path="docker-compose.yml",
-                language="yaml",
-                category="infrastructure",
-                content=compose,
-            ),
-            GeneratedFile(
-                path="Makefile",
-                language="makefile",
-                category="infrastructure",
-                content=makefile,
-            ),
-        ]
-
-        if include_frontend:
-            frontend_dockerfile = (
-                "FROM node:22-alpine\n"
-                "WORKDIR /app\n"
-                "COPY package.json .\n"
-                "RUN npm install\n"
-                "COPY . .\n"
-                "EXPOSE 3000\n"
-                'CMD ["npm", "run", "dev"]\n'
-            )
-            infra_files.append(
-                GeneratedFile(
-                    path="frontend/Dockerfile",
-                    language="dockerfile",
-                    category="infrastructure",
-                    content=frontend_dockerfile,
+            ok = self._run_cli(["go", "mod", "init", slug], backend_dir, cli_log)
+            if not ok:
+                (backend_dir / "go.mod").write_text(
+                    f"module {slug}\n\ngo 1.23\n", encoding="utf-8"
                 )
+
+        elif stack == TargetLanguage.TYPESCRIPT_NEST_OR_NODE:
+            ok = self._run_cli(["npm", "init", "-y"], backend_dir, cli_log)
+            pkg_path = backend_dir / "package.json"
+            pkg_data = (
+                json.loads(pkg_path.read_text(encoding="utf-8"))
+                if pkg_path.exists()
+                else {"name": f"{slug}-backend", "version": "1.0.0"}
             )
+            pkg_data["scripts"] = {
+                "dev": "tsx watch src/adapters/api/server.ts",
+                "start": "tsx src/adapters/api/server.ts",
+            }
+            pkg_data["devDependencies"] = {
+                "typescript": "^5.7.0",
+                "tsx": "^4.19.0",
+                "@types/node": "^22.0.0",
+            }
+            pkg_path.write_text(json.dumps(pkg_data, indent=2), encoding="utf-8")
+            self._run_cli(["npx", "--yes", "tsc", "--init"], backend_dir, cli_log)
 
-        return infra_files
+        elif stack == TargetLanguage.RUST_AXUM:
+            ok = self._run_cli(
+                ["cargo", "init", "--bin", "--name", slug.replace("_", "-")],
+                backend_dir,
+                cli_log,
+            )
+            if not ok:
+                (backend_dir / "Cargo.toml").write_text(
+                    f'[package]\nname = "{slug.replace("_", "-")}"\nversion = "0.1.0"\nedition = "2021"\n\n'
+                    '[dependencies]\naxum = "0.7"\ntokio = { version = "1", features = ["full"] }\n'
+                    'serde = { version = "1", features = ["derive"] }\nserde_json = "1"\n',
+                    encoding="utf-8",
+                )
 
-    def _generate_ai_documentation_files(
-        self, ir: ProjectIR, include_frontend: bool
-    ) -> List[GeneratedFile]:
-        arch = ir.architecture_decision
-        assert arch is not None
+        elif stack == TargetLanguage.CSHARP_DOTNET:
+            ok = self._run_cli(
+                [
+                    "dotnet",
+                    "new",
+                    "webapi",
+                    "-n",
+                    "KickStarterApi",
+                    "-o",
+                    ".",
+                    "--no-restore",
+                ],
+                backend_dir,
+                cli_log,
+            )
+            if not ok:
+                (backend_dir / "KickStarterApi.csproj").write_text(
+                    '<Project Sdk="Microsoft.NET.Sdk.Web">\n'
+                    "  <PropertyGroup>\n"
+                    "    <TargetFramework>net8.0</TargetFramework>\n"
+                    "    <Nullable>enable</Nullable>\n"
+                    "    <ImplicitUsings>enable</ImplicitUsings>\n"
+                    "  </PropertyGroup>\n"
+                    "</Project>\n",
+                    encoding="utf-8",
+                )
 
-        rules_md = "\n".join(
-            f"- **{r.title}** (`{r.id}`): {r.expected_behavior}"
-            for r in ir.business_rules
-        )
-        frontend_note = (
-            "\n## 3. Frontend Componentization Rules (`frontend/`)\n"
-            "1. **No Monolithic Pages:** Pages in `src/app/` must only compose components and hooks (< 60 lines).\n"
-            "2. **Domain Component Isolation:** Each Entity has its own `<Entity>Card.tsx` and `<Entity>Table.tsx` inside `src/components/domain/`.\n"
-            "3. **Strict API Layer:** Components must never call `fetch()` directly; use `src/services/apiClient.ts`.\n"
-            if include_frontend
-            else ""
-        )
+        else:
+            # Python FastAPI: Create modern PEP-621 pyproject.toml + requirements.txt
+            (backend_dir / "pyproject.toml").write_text(
+                f'[project]\nname = "{slug}-backend"\nversion = "0.1.0"\n'
+                'requires-python = ">=3.12"\n'
+                'dependencies = ["fastapi>=0.115.0", "uvicorn[standard]>=0.30.6", "pydantic>=2.10.0", "httpx>=0.27.2", "pytest>=8.3.0"]\n',
+                encoding="utf-8",
+            )
+            (backend_dir / "requirements.txt").write_text(
+                "fastapi>=0.115.0\nuvicorn[standard]>=0.30.6\npydantic>=2.10.0\nhttpx>=0.27.2\npytest>=8.3.0\n",
+                encoding="utf-8",
+            )
+            cli_log.append("[OK] Initialized PEP-621 pyproject.toml for Python FastAPI")
 
-        agents_md = (
-            f"# {ir.project_name} — AI Agent Maintenance Guide (AGENTS.md)\n\n"
-            f"## 1. Architecture Overview\n"
-            f"- **Pattern:** `{arch.chosen_pattern.value}`\n"
-            f"- **Backend Stack:** `{arch.chosen_backend_language.value}` + `{arch.chosen_database}`\n"
-            f"- **Frontend Stack:** `{arch.chosen_frontend_stack or 'None'}`\n"
-            f"- **AI-Friendliness Score:** `{arch.ai_friendliness_score}/100`\n"
-            f"- **Rationale:** {arch.rationale}\n\n"
-            f"## 2. Backend Boundary Rules (`backend/`)\n"
-            f"1. **Domain Purity:** `src/domain/` must NEVER import from `src/adapters/` or HTTP frameworks.\n"
-            f"2. **Dependency Inversion:** Use Cases in `src/application/` depend strictly on Repository Ports.\n"
-            f"3. **Verified Business Rules (HITL Approved):**\n"
-            f"{rules_md or '- No custom rules extracted.'}\n"
-            f"{frontend_note}"
-        )
-
-        return [
-            GeneratedFile(
-                path="AGENTS.md",
-                language="markdown",
-                category="docs",
-                content=agents_md,
-            ),
-            GeneratedFile(
-                path="regen_blueprint.ir.json",
-                language="json",
-                category="docs",
-                content=json.dumps(ir.model_dump(mode="json"), indent=2),
-            ),
+    def _overlay_backend_architecture(
+        self, backend_dir: Path, ir: ProjectIR, stack: TargetLanguage
+    ) -> None:
+        entities = ir.entities or [
+            EntityDefinition(name="SampleItem", description="Default entity", fields=[])
         ]
 
+        if stack == TargetLanguage.GO_FIBER_OR_CHI:
+            self._write_go_layers(backend_dir, ir, entities)
+        elif stack == TargetLanguage.TYPESCRIPT_NEST_OR_NODE:
+            self._write_ts_backend_layers(backend_dir, ir, entities)
+        elif stack == TargetLanguage.RUST_AXUM:
+            self._write_rust_layers(backend_dir, ir, entities)
+        elif stack == TargetLanguage.CSHARP_DOTNET:
+            self._write_csharp_layers(backend_dir, ir, entities)
+        else:
+            self._write_python_layers(backend_dir, ir, entities)
+
+        # Always add Phase 5 Strangler Fig Parity Test Suite
+        tests_dir = backend_dir / "tests"
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        (tests_dir / "test_strangler_parity.py").write_text(
+            strangler_generator.render_parity_test_file(ir), encoding="utf-8"
+        )
+
     # ========================================================================
-    # 2. COMPONENTIZED NEXT.JS FRONTEND GENERATOR (HIGH COHESION / LOOSE COUPLING)
+    # FRONTEND CLI INITIALIZERS (NEXT.JS, REACT+VITE, VUE+VITE, SVELTEKIT, ANGULAR)
     # ========================================================================
 
-    def _generate_componentized_nextjs_frontend(
-        self, ir: ProjectIR
-    ) -> List[GeneratedFile]:
+    def _init_frontend_via_cli(
+        self,
+        root_dir: Path,
+        slug: str,
+        fe_stack: TargetFrontend,
+        cli_log: List[str],
+    ) -> None:
+        fe_dir = root_dir / "frontend"
+
+        if fe_stack == TargetFrontend.NEXTJS:
+            ok = self._run_cli(
+                [
+                    "npx",
+                    "--yes",
+                    "create-next-app@latest",
+                    "frontend",
+                    "--ts",
+                    "--tailwind",
+                    "--eslint",
+                    "--app",
+                    "--src-dir",
+                    "--import-alias",
+                    "@/*",
+                    "--use-npm",
+                    "--skip-install",
+                    "--yes",
+                ],
+                root_dir,
+                cli_log,
+                timeout_sec=60,
+            )
+            if not ok:
+                self._write_fallback_nextjs_base(fe_dir, slug)
+
+        elif fe_stack == TargetFrontend.REACT_VITE:
+            ok = self._run_cli(
+                [
+                    "npm",
+                    "create",
+                    "vite@latest",
+                    "frontend",
+                    "--",
+                    "--template",
+                    "react-ts",
+                ],
+                root_dir,
+                cli_log,
+            )
+            if not ok:
+                self._write_fallback_vite_base(fe_dir, slug, "react")
+
+        elif fe_stack == TargetFrontend.VUE_VITE:
+            ok = self._run_cli(
+                [
+                    "npm",
+                    "create",
+                    "vite@latest",
+                    "frontend",
+                    "--",
+                    "--template",
+                    "vue-ts",
+                ],
+                root_dir,
+                cli_log,
+            )
+            if not ok:
+                self._write_fallback_vite_base(fe_dir, slug, "vue")
+
+        elif fe_stack == TargetFrontend.SVELTEKIT:
+            ok = self._run_cli(
+                [
+                    "npx",
+                    "--yes",
+                    "sv",
+                    "create",
+                    "frontend",
+                    "--template",
+                    "minimal",
+                    "--types",
+                    "ts",
+                    "--no-install",
+                    "--no-add-ons",
+                ],
+                root_dir,
+                cli_log,
+            )
+            if not ok:
+                self._write_fallback_vite_base(fe_dir, slug, "sveltekit")
+
+        elif fe_stack == TargetFrontend.ANGULAR:
+            ok = self._run_cli(
+                [
+                    "npx",
+                    "--yes",
+                    "@angular/cli@latest",
+                    "new",
+                    "frontend",
+                    "--skip-install",
+                    "--skip-git",
+                    "--defaults",
+                    "--style=css",
+                    "--routing=true",
+                ],
+                root_dir,
+                cli_log,
+                timeout_sec=60,
+            )
+            if not ok:
+                self._write_fallback_vite_base(fe_dir, slug, "angular")
+
+    def _overlay_frontend_architecture(
+        self, fe_dir: Path, ir: ProjectIR, fe_stack: TargetFrontend
+    ) -> None:
+        """
+        Injects modular, high-cohesion Domain Types, API Service Client,
+        and per-Entity UI components into whichever frontend framework was chosen.
+        """
         ts_type_map = {
             DataTypePrimitive.STRING: "string",
             DataTypePrimitive.INTEGER: "number",
@@ -312,47 +451,19 @@ class ScaffolderEngine:
             DataTypePrimitive.UUID: "string",
             DataTypePrimitive.JSON: "Record<string, unknown>",
         }
-
-        files: List[GeneratedFile] = []
-
-        # A. frontend/package.json & tsconfig.json
-        pkg_json = {
-            "name": f"{ir.project_name.lower().replace(' ', '-')}-frontend",
-            "version": "0.1.0",
-            "private": True,
-            "scripts": {
-                "dev": "next dev",
-                "build": "next build",
-                "start": "next start",
-            },
-            "dependencies": {
-                "next": "^15.0.0",
-                "react": "^19.0.0",
-                "react-dom": "^19.0.0",
-                "lucide-react": "^0.454.0",
-            },
-        }
-        files.append(
-            GeneratedFile(
-                path="frontend/package.json",
-                language="json",
-                category="infrastructure",
-                content=json.dumps(pkg_json, indent=2),
-            )
-        )
-
-        # B. frontend/src/types/domain.ts (Strict TS Interfaces per IR Entity)
-        type_lines = [
-            "// Auto-generated by REGEN from ProjectIR Entities.",
-            "// Do not untype or use `any` — AI agents rely on these strict contracts.",
-            "",
-        ]
-        entities_to_render = ir.entities or [
+        entities = ir.entities or [
             EntityDefinition(name="SampleItem", description="Default entity", fields=[])
         ]
 
-        for ent in entities_to_render:
-            type_lines.append(f"/** {ent.description} */")
+        src_dir = fe_dir / "src"
+        types_dir = src_dir / "types"
+        services_dir = src_dir / "services"
+        types_dir.mkdir(parents=True, exist_ok=True)
+        services_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Universal TypeScript Domain Contracts (`src/types/domain.ts`)
+        type_lines = ["// Auto-generated by REGEN from ProjectIR Entities.\n"]
+        for ent in entities:
             type_lines.append(f"export interface {ent.name} {{")
             if not ent.fields:
                 type_lines.append("  id: number;")
@@ -361,219 +472,91 @@ class ScaffolderEngine:
                 opt = "" if f.is_required else "?"
                 type_lines.append(f"  {f.name}{opt}: {ts_t};")
             type_lines.append("}\n")
+        (types_dir / "domain.ts").write_text("\n".join(type_lines), encoding="utf-8")
 
-        files.append(
-            GeneratedFile(
-                path="frontend/src/types/domain.ts",
-                language="typescript",
-                category="frontend-data",
-                content="\n".join(type_lines),
-            )
-        )
-
-        # C. frontend/src/services/apiClient.ts (Decoupled Data Fetching Service)
-        entity_imports = ", ".join(ent.name for ent in entities_to_render)
-        api_client_lines = [
-            f'import {{ {entity_imports} }} from "../types/domain";',
+        # 2. Universal Typed API Client (`src/services/apiClient.ts`)
+        entity_imports = ", ".join(ent.name for ent in entities)
+        api_lines = [
+            f'import type {{ {entity_imports} }} from "../types/domain";',
             "",
-            'const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";',
+            'const API_BASE_URL = "http://localhost:8000";',
             "",
             "async function request<T>(path: string, options?: RequestInit): Promise<T> {",
             "  const response = await fetch(`${API_BASE_URL}${path}`, {",
             '    headers: { "Content-Type": "application/json" },',
             "    ...options,",
             "  });",
-            "  if (!response.ok) {",
-            "    throw new Error(`API Error ${response.status}: ${response.statusText}`);",
-            "  }",
+            "  if (!response.ok) throw new Error(`API Error ${response.status}`);",
             "  return response.json() as Promise<T>;",
             "}",
             "",
             "export const apiClient = {",
             '  checkHealth: () => request<{ status: string }>("/health"),',
         ]
-        for ent in entities_to_render:
-            slug = ent.name.lower() + "s"
-            api_client_lines.append(
-                f'  list{ent.name}s: () => request<{ent.name}[]>("/{slug}"),'
+        for ent in entities:
+            api_lines.append(
+                f'  list{ent.name}s: () => request<{ent.name}[]>("/{ent.name.lower()}s"),'
             )
-        api_client_lines.append("};\n")
+        api_lines.append("};\n")
+        (services_dir / "apiClient.ts").write_text(
+            "\n".join(api_lines), encoding="utf-8"
+        )
 
-        files.append(
-            GeneratedFile(
-                path="frontend/src/services/apiClient.ts",
-                language="typescript",
-                category="frontend-data",
-                content="\n".join(api_client_lines),
+        # 3. Framework-Specific Componentized Domain Views
+        if fe_stack in (TargetFrontend.NEXTJS, TargetFrontend.REACT_VITE):
+            comp_dir = src_dir / "components" / "domain"
+            layout_dir = src_dir / "components" / "layout"
+            comp_dir.mkdir(parents=True, exist_ok=True)
+            layout_dir.mkdir(parents=True, exist_ok=True)
+
+            (layout_dir / "AppShell.tsx").write_text(
+                self._render_react_app_shell(), encoding="utf-8"
             )
-        )
+            for ent in entities:
+                (comp_dir / f"{ent.name}Table.tsx").write_text(
+                    self._render_react_entity_table(ent), encoding="utf-8"
+                )
+                (comp_dir / f"{ent.name}Card.tsx").write_text(
+                    self._render_react_entity_card(ent), encoding="utf-8"
+                )
 
-        # D. frontend/src/components/layout/AppShell.tsx (Reusable Layout Shell)
-        app_shell_tsx = (
-            'import React from "react";\n\n'
-            "interface AppShellProps {\n"
-            "  title: string;\n"
-            "  children: React.ReactNode;\n"
-            "}\n\n"
-            "export function AppShell({ title, children }: AppShellProps) {\n"
-            "  return (\n"
-            '    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">\n'
-            '      <header className="border-b border-slate-800 bg-slate-900 px-6 py-4 flex items-center justify-between">\n'
-            '        <h1 className="text-lg font-bold tracking-tight text-emerald-400">{title}</h1>\n'
-            '        <span className="text-xs font-mono text-slate-400">REGEN Kick-Starter</span>\n'
-            "      </header>\n"
-            '      <main className="flex-1 max-w-6xl w-full mx-auto p-6 space-y-6">\n'
-            "        {children}\n"
-            "      </main>\n"
-            "    </div>\n"
-            "  );\n"
-            "}\n"
-        )
-        files.append(
-            GeneratedFile(
-                path="frontend/src/components/layout/AppShell.tsx",
-                language="typescript",
-                category="frontend-ui",
-                content=app_shell_tsx,
-            )
-        )
+            if fe_stack == TargetFrontend.NEXTJS:
+                app_dir = src_dir / "app"
+                app_dir.mkdir(parents=True, exist_ok=True)
+                (app_dir / "page.tsx").write_text(
+                    self._render_react_dashboard_page(ir.project_name, entities),
+                    encoding="utf-8",
+                )
+            else:
+                (src_dir / "App.tsx").write_text(
+                    self._render_react_dashboard_page(
+                        ir.project_name, entities, is_vite=True
+                    ),
+                    encoding="utf-8",
+                )
 
-        # E. Dedicated Domain Components per Entity (<Entity>Table.tsx & <Entity>Card.tsx)
-        for ent in entities_to_render:
-            files.append(self._build_entity_table_component(ent))
-            files.append(self._build_entity_card_component(ent))
-
-        # F. Clean, Modular `frontend/src/app/page.tsx` (< 45 lines, pure composition)
-        table_imports = "\n".join(
-            f'import {{ {ent.name}Table }} from "../components/domain/{ent.name}Table";'
-            for ent in entities_to_render
-        )
-        table_mounts = "\n      ".join(
-            f"<{ent.name}Table items={{[]}} />" for ent in entities_to_render
-        )
-
-        clean_page_tsx = (
-            'import React from "react";\n'
-            'import { AppShell } from "../components/layout/AppShell";\n'
-            f"{table_imports}\n\n"
-            f"export default function {ir.project_name.replace(' ', '')}DashboardPage() {{\n"
-            "  return (\n"
-            f'    <AppShell title="{ir.project_name} Workspace">\n'
-            '      <section className="space-y-6">\n'
-            f"        {table_mounts}\n"
-            "      </section>\n"
-            "    </AppShell>\n"
-            "  );\n"
-            "}\n"
-        )
-        files.append(
-            GeneratedFile(
-                path="frontend/src/app/page.tsx",
-                language="typescript",
-                category="frontend-ui",
-                content=clean_page_tsx,
-            )
-        )
-
-        return files
-
-    @staticmethod
-    def _build_entity_table_component(ent: EntityDefinition) -> GeneratedFile:
-        headers = (
-            "\n              ".join(
-                f'<th className="px-4 py-2 text-left text-xs font-semibold text-slate-400">{f.name}</th>'
-                for f in ent.fields
-            )
-            or '<th className="px-4 py-2 text-left">ID</th>'
-        )
-
-        cells = (
-            "\n                ".join(
-                f'<td className="px-4 py-2 text-sm font-mono">{{String(item.{f.name})}}</td>'
-                for f in ent.fields
-            )
-            or '<td className="px-4 py-2">{item.id}</td>'
-        )
-
-        pk_field = next((f.name for f in ent.fields if f.is_primary_key), None)
-        row_key = f"String(item.{pk_field})" if pk_field else "idx"
-
-        content = (
-            'import React from "react";\n'
-            f'import {{ {ent.name} }} from "../../types/domain";\n\n'
-            f"interface {ent.name}TableProps {{\n"
-            f"  items: {ent.name}[];\n"
-            "}\n\n"
-            f"export function {ent.name}Table({{ items }}: {ent.name}TableProps) {{\n"
-            "  return (\n"
-            '    <div className="rounded-xl border border-slate-800 bg-slate-900/60 overflow-hidden">\n'
-            '      <div className="px-4 py-3 border-b border-slate-800 flex justify-between items-center">\n'
-            f'        <h2 className="text-sm font-semibold text-slate-200">{ent.name} Records</h2>\n'
-            '        <span className="text-xs text-slate-400">{items.length} total</span>\n'
-            "      </div>\n"
-            '      <table className="w-full border-collapse">\n'
-            '        <thead className="bg-slate-950/60 border-b border-slate-800">\n'
-            "          <tr>\n"
-            f"              {headers}\n"
-            "          </tr>\n"
-            "        </thead>\n"
-            "        <tbody>\n"
-            "          {items.map((item, idx) => (\n"
-            f'            <tr key={{{row_key}}} className="border-b border-slate-800/50">\n'
-            f"                {cells}\n"
-            "            </tr>\n"
-            "          ))}\n"
-            "        </tbody>\n"
-            "      </table>\n"
-            "    </div>\n"
-            "  );\n"
-            "}\n"
-        )
-        return GeneratedFile(
-            path=f"frontend/src/components/domain/{ent.name}Table.tsx",
-            language="typescript",
-            category="frontend-ui",
-            content=content,
-        )
-
-    @staticmethod
-    def _build_entity_card_component(ent: EntityDefinition) -> GeneratedFile:
-        field_rows = "\n        ".join(
-            f'<div className="flex justify-between text-xs">'
-            f'<span className="text-slate-400">{f.name}:</span>'
-            f'<span className="font-mono text-slate-200">{{String(data.{f.name})}}</span>'
-            f"</div>"
-            for f in ent.fields
-        )
-        content = (
-            'import React from "react";\n'
-            f'import {{ {ent.name} }} from "../../types/domain";\n\n'
-            f"interface {ent.name}CardProps {{\n"
-            f"  data: {ent.name};\n"
-            "}\n\n"
-            f"export function {ent.name}Card({{ data }}: {ent.name}CardProps) {{\n"
-            "  return (\n"
-            '    <div className="p-4 rounded-xl border border-slate-800 bg-slate-900 space-y-2">\n'
-            f'      <h3 className="text-sm font-bold text-emerald-400">{ent.name}</h3>\n'
-            '      <div className="space-y-1">\n'
-            f"        {field_rows}\n"
-            "      </div>\n"
-            "    </div>\n"
-            "  );\n"
-            "}\n"
-        )
-        return GeneratedFile(
-            path=f"frontend/src/components/domain/{ent.name}Card.tsx",
-            language="typescript",
-            category="frontend-ui",
-            content=content,
-        )
+        elif fe_stack == TargetFrontend.VUE_VITE:
+            comp_dir = src_dir / "components" / "domain"
+            comp_dir.mkdir(parents=True, exist_ok=True)
+            for ent in entities:
+                (comp_dir / f"{ent.name}Table.vue").write_text(
+                    self._render_vue_entity_table(ent), encoding="utf-8"
+                )
 
     # ========================================================================
-    # 3. BACKEND STACK GENERATORS (SCOPED TO `backend/`)
+    # BACKEND LAYER WRITERS
     # ========================================================================
 
-    def _generate_python_hexagonal_stack(self, ir: ProjectIR) -> List[GeneratedFile]:
+    def _write_python_layers(
+        self, backend_dir: Path, ir: ProjectIR, entities: List[EntityDefinition]
+    ) -> None:
+        src = backend_dir / "src"
+        for sub in ("domain", "ports", "application", "adapters/db", "adapters/api"):
+            d = src / sub
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "__init__.py").write_text("", encoding="utf-8")
+        (src / "__init__.py").write_text("", encoding="utf-8")
+
         py_type_map = {
             DataTypePrimitive.STRING: "str",
             DataTypePrimitive.INTEGER: "int",
@@ -585,41 +568,69 @@ class ScaffolderEngine:
             DataTypePrimitive.JSON: "dict",
         }
 
-        entity_lines = [
+        ent_lines = [
             "from typing import Optional",
             "from pydantic import BaseModel",
             "",
         ]
-        for ent in ir.entities:
-            entity_lines.append(f"class {ent.name}(BaseModel):")
-            entity_lines.append(f'    """{ent.description}"""')
+        port_lines = [
+            "from abc import ABC, abstractmethod",
+            "from typing import List",
+            "from src.domain.entities import *",
+            "",
+        ]
+        repo_lines = [
+            "from typing import List",
+            "from src.domain.entities import *",
+            "from src.ports.repositories import *",
+            "",
+        ]
+
+        for ent in entities:
+            ent_lines.append(f"class {ent.name}(BaseModel):")
+            ent_lines.append(f'    """{ent.description}"""')
             if not ent.fields:
-                entity_lines.append("    id: int")
+                ent_lines.append("    id: int")
             for f in ent.fields:
                 py_t = py_type_map.get(f.data_type, "str")
-                if not f.is_required:
-                    entity_lines.append(f"    {f.name}: Optional[{py_t}] = None")
-                else:
-                    entity_lines.append(f"    {f.name}: {py_t}")
-            entity_lines.append("")
+                ent_lines.append(
+                    f"    {f.name}: {py_t}"
+                    if f.is_required
+                    else f"    {f.name}: Optional[{py_t}] = None"
+                )
+            ent_lines.append("")
 
-        use_case_lines = [
-            '"""Application Use Cases enforcing HITL-verified Business Rules."""',
+            port_lines.extend(
+                [
+                    f"class {ent.name}RepositoryPort(ABC):",
+                    "    @abstractmethod",
+                    f"    def list_all(self) -> List[{ent.name}]: ...",
+                    "",
+                ]
+            )
+            repo_lines.extend(
+                [
+                    f"class InMemory{ent.name}Repository({ent.name}RepositoryPort):",
+                    "    def __init__(self) -> None:",
+                    f"        self._items: List[{ent.name}] = []",
+                    f"    def list_all(self) -> List[{ent.name}]:",
+                    "        return self._items",
+                    "",
+                ]
+            )
+
+        uc_lines = [
             "from typing import Any, Dict",
             "",
             "class DomainRuleEngine:",
         ]
         if not ir.business_rules:
-            use_case_lines.append("    pass")
+            uc_lines.append("    pass")
         for idx, rule in enumerate(ir.business_rules, start=1):
-            use_case_lines.extend(
+            uc_lines.extend(
                 [
                     f"    def enforce_rule_{idx}_{rule.id}(self, context: Dict[str, Any]) -> Dict[str, Any]:",
-                    f'        """',
-                    f"        Rule: {rule.title}",
-                    f"        Trigger: {rule.trigger_condition}",
-                    f"        Verified Behavior: {rule.expected_behavior}",
-                    f'        """',
+                    f'        """{rule.title}: {rule.expected_behavior}"""',
                     f'        return {{"rule_id": "{rule.id}", "enforced": True, "context": context}}',
                     "",
                 ]
@@ -627,10 +638,12 @@ class ScaffolderEngine:
 
         api_lines = [
             "from fastapi import FastAPI",
+            "from fastapi.middleware.cors import CORSMiddleware",
             "from src.domain.entities import *",
             "from src.application.use_cases import DomainRuleEngine",
             "",
-            f'app = FastAPI(title="{ir.project_name} - Kick-Starter API")',
+            f'app = FastAPI(title="{ir.project_name} API")',
+            'app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])',
             "rule_engine = DomainRuleEngine()",
             "",
             '@app.get("/health")',
@@ -639,8 +652,8 @@ class ScaffolderEngine:
             "",
         ]
         for route in ir.routes:
-            method_lower = route.method.value.lower()
-            fn_name = (
+            m = route.method.value.lower()
+            fn = (
                 route.path.strip("/")
                 .replace("/", "_")
                 .replace("{", "")
@@ -649,42 +662,39 @@ class ScaffolderEngine:
             )
             api_lines.extend(
                 [
-                    f'@app.{method_lower}("{route.path}")',
-                    f"def handle_{method_lower}_{fn_name}():",
+                    f'@app.{m}("{route.path}")',
+                    f"def handle_{m}_{fn}():",
                     f'    """{route.summary}"""',
                     "    return []",
                     "",
                 ]
             )
 
-        return [
-            GeneratedFile(
-                path="backend/requirements.txt",
-                language="text",
-                category="infrastructure",
-                content="fastapi>=0.115.0\nuvicorn[standard]>=0.30.6\npydantic>=2.10.0\nhttpx>=0.27.2\npytest>=8.3.0\n",
-            ),
-            GeneratedFile(
-                path="backend/src/domain/entities.py",
-                language="python",
-                category="domain",
-                content="\n".join(entity_lines),
-            ),
-            GeneratedFile(
-                path="backend/src/application/use_cases.py",
-                language="python",
-                category="application",
-                content="\n".join(use_case_lines),
-            ),
-            GeneratedFile(
-                path="backend/src/adapters/api/main.py",
-                language="python",
-                category="adapter",
-                content="\n".join(api_lines),
-            ),
-        ]
+        (src / "domain/entities.py").write_text("\n".join(ent_lines), encoding="utf-8")
+        (src / "ports/repositories.py").write_text(
+            "\n".join(port_lines), encoding="utf-8"
+        )
+        (src / "application/use_cases.py").write_text(
+            "\n".join(uc_lines), encoding="utf-8"
+        )
+        (src / "adapters/db/repositories.py").write_text(
+            "\n".join(repo_lines), encoding="utf-8"
+        )
+        (src / "adapters/api/main.py").write_text(
+            "\n".join(api_lines), encoding="utf-8"
+        )
 
-    def _generate_go_hexagonal_stack(self, ir: ProjectIR) -> List[GeneratedFile]:
+    def _write_go_layers(
+        self, backend_dir: Path, ir: ProjectIR, entities: List[EntityDefinition]
+    ) -> None:
+        for sub in (
+            "internal/domain",
+            "internal/ports",
+            "internal/application",
+            "cmd/api",
+        ):
+            (backend_dir / sub).mkdir(parents=True, exist_ok=True)
+
         go_type_map = {
             DataTypePrimitive.STRING: "string",
             DataTypePrimitive.INTEGER: "int64",
@@ -692,116 +702,462 @@ class ScaffolderEngine:
             DataTypePrimitive.DECIMAL: "float64",
             DataTypePrimitive.BOOLEAN: "bool",
         }
-
-        domain_lines = ["package domain", ""]
-        for ent in ir.entities:
-            domain_lines.append(f"// {ent.name} - {ent.description}")
-            domain_lines.append(f"type {ent.name} struct {{")
+        dom = ["package domain\n"]
+        for ent in entities:
+            dom.append(f"type {ent.name} struct {{")
             for f in ent.fields:
                 go_t = go_type_map.get(f.data_type, "string")
-                pascal_field = "".join(w.capitalize() for w in f.name.split("_"))
-                domain_lines.append(f'\t{pascal_field} {go_t} `json:"{f.name}"`')
-            domain_lines.append("}\n")
+                pascal = "".join(w.capitalize() for w in f.name.split("_"))
+                dom.append(f'\t{pascal} {go_t} `json:"{f.name}"`')
+            dom.append("}\n")
+        (backend_dir / "internal/domain/entities.go").write_text(
+            "\n".join(dom), encoding="utf-8"
+        )
 
         rules_comments = "\n".join(
             f"// Rule [{r.id}]: {r.title} -> {r.expected_behavior}"
             for r in ir.business_rules
         )
-        usecase_go = (
-            "package application\n\n"
-            "// Verified Business Rules from REGEN HITL Wizard:\n"
-            f"{rules_comments}\n\n"
-            "type RuleService struct{}\n\n"
-            "func NewRuleService() *RuleService {\n"
-            "\treturn &RuleService{}\n"
-            "}\n"
+        (backend_dir / "internal/application/usecases.go").write_text(
+            f"package application\n\n{rules_comments}\n\ntype RuleEngine struct{{}}\n",
+            encoding="utf-8",
         )
 
         main_go = (
-            "package main\n\n"
-            "import (\n"
-            '\t"encoding/json"\n'
-            '\t"log"\n'
-            '\t"net/http"\n'
-            ")\n\n"
+            'package main\n\nimport (\n\t"encoding/json"\n\t"log"\n\t"net/http"\n)\n\n'
             "func main() {\n"
             '\thttp.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {\n'
             '\t\tw.Header().Set("Content-Type", "application/json")\n'
             f'\t\tjson.NewEncoder(w).Encode(map[string]string{{"status": "ok", "project": "{ir.project_name}"}})\n'
             "\t})\n"
+            '\tlog.Println("Go Hexagonal Server listening on :8000")\n'
+            '\tlog.Fatal(http.ListenAndServe(":8000", nil))\n}\n'
         )
-        for route in ir.routes:
-            main_go += (
-                f'\thttp.HandleFunc("{route.path}", func(w http.ResponseWriter, r *http.Request) {{\n'
-                '\t\tw.Header().Set("Content-Type", "application/json")\n'
-                '\t\tw.Write([]byte("[]"))\n'
-                "\t})\n"
-            )
-        main_go += (
-            '\tlog.Println("Kick-Starter Go Hexagonal Server listening on :8000")\n'
-            '\tlog.Fatal(http.ListenAndServe(":8000", nil))\n'
+        (backend_dir / "cmd/api/main.go").write_text(main_go, encoding="utf-8")
+
+    def _write_ts_backend_layers(
+        self, backend_dir: Path, ir: ProjectIR, entities: List[EntityDefinition]
+    ) -> None:
+        for sub in ("src/domain", "src/ports", "src/application", "src/adapters/api"):
+            (backend_dir / sub).mkdir(parents=True, exist_ok=True)
+
+        ent_lines = ["// Strict Hexagonal Domain Entities\n"]
+        for ent in entities:
+            ent_lines.append(f"export interface {ent.name} {{")
+            for f in ent.fields:
+                ent_lines.append(f"  {f.name}: string | number | boolean;")
+            ent_lines.append("}\n")
+        (backend_dir / "src/domain/entities.ts").write_text(
+            "\n".join(ent_lines), encoding="utf-8"
+        )
+
+        server_ts = (
+            'import http from "node:http";\n\n'
+            "const server = http.createServer((req, res) => {\n"
+            '  res.setHeader("Content-Type", "application/json");\n'
+            f'  res.end(JSON.stringify({{ status: "ok", project: "{ir.project_name}" }}));\n'
+            "});\n"
+            'server.listen(8000, () => console.log("TS Hexagonal Server on :8000"));\n'
+        )
+        (backend_dir / "src/adapters/api/server.ts").write_text(
+            server_ts, encoding="utf-8"
+        )
+
+    def _write_rust_layers(
+        self, backend_dir: Path, ir: ProjectIR, entities: List[EntityDefinition]
+    ) -> None:
+        src = backend_dir / "src"
+        src.mkdir(parents=True, exist_ok=True)
+        ent_lines = ["use serde::{Serialize, Deserialize};\n"]
+        for ent in entities:
+            ent_lines.append("#[derive(Debug, Clone, Serialize, Deserialize)]")
+            ent_lines.append(f"pub struct {ent.name} {{")
+            for f in ent.fields:
+                ent_lines.append(f"    pub {f.name}: String,")
+            ent_lines.append("}\n")
+        (src / "domain.rs").write_text("\n".join(ent_lines), encoding="utf-8")
+
+    def _write_csharp_layers(
+        self, backend_dir: Path, ir: ProjectIR, entities: List[EntityDefinition]
+    ) -> None:
+        dom = backend_dir / "Domain"
+        dom.mkdir(parents=True, exist_ok=True)
+        lines = ["namespace KickStarterApi.Domain;\n"]
+        for ent in entities:
+            lines.append(f"public record {ent.name}(")
+            fields_cs = ", ".join(f"string {f.name}" for f in ent.fields) or "int Id"
+            lines.append(f"    {fields_cs}")
+            lines.append(");\n")
+        (dom / "Entities.cs").write_text("\n".join(lines), encoding="utf-8")
+
+    # ========================================================================
+    # FRONTEND COMPONENT TEMPLATES & FALLBACKS
+    # ========================================================================
+
+    def _write_fallback_nextjs_base(self, fe_dir: Path, slug: str) -> None:
+        (fe_dir / "src/app").mkdir(parents=True, exist_ok=True)
+        pkg = {
+            "name": f"{slug}-frontend",
+            "version": "0.1.0",
+            "private": True,
+            "scripts": {
+                "dev": "next dev",
+                "build": "next build",
+                "start": "next start",
+            },
+            "dependencies": {
+                "next": "^15.1.0",
+                "react": "^19.0.0",
+                "react-dom": "^19.0.0",
+            },
+            "devDependencies": {
+                "typescript": "^5",
+                "@types/react": "^19",
+                "tailwindcss": "^4",
+                "@tailwindcss/postcss": "^4",
+            },
+        }
+        (fe_dir / "package.json").write_text(
+            json.dumps(pkg, indent=2), encoding="utf-8"
+        )
+        (fe_dir / "src/app/globals.css").write_text(
+            '@import "tailwindcss";\n', encoding="utf-8"
+        )
+        (fe_dir / "src/app/layout.tsx").write_text(
+            'import "./globals.css";\nexport default function RootLayout({ children }: { children: React.ReactNode }) {\n'
+            '  return <html lang="en"><body className="bg-slate-950 text-slate-100">{children}</body></html>;\n}\n',
+            encoding="utf-8",
+        )
+
+    def _write_fallback_vite_base(
+        self, fe_dir: Path, slug: str, framework: str
+    ) -> None:
+        (fe_dir / "src").mkdir(parents=True, exist_ok=True)
+        pkg = {
+            "name": f"{slug}-{framework}",
+            "version": "0.1.0",
+            "private": True,
+            "scripts": {"dev": "vite", "build": "vite build"},
+        }
+        (fe_dir / "package.json").write_text(
+            json.dumps(pkg, indent=2), encoding="utf-8"
+        )
+
+    @staticmethod
+    def _render_react_app_shell() -> str:
+        return (
+            'import React from "react";\n\n'
+            "export function AppShell({ title, children }: { title: string; children: React.ReactNode }) {\n"
+            "  return (\n"
+            '    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">\n'
+            '      <header className="border-b border-slate-800 bg-slate-900 px-6 py-4 flex justify-between items-center">\n'
+            '        <h1 className="text-lg font-bold text-emerald-400">{title}</h1>\n'
+            '        <span className="text-xs font-mono text-slate-400">Generated by REGEN</span>\n'
+            "      </header>\n"
+            '      <main className="flex-1 max-w-6xl w-full mx-auto p-6 space-y-6">{children}</main>\n'
+            "    </div>\n"
+            "  );\n"
             "}\n"
         )
 
-        return [
-            GeneratedFile(
-                path="backend/internal/domain/entities.go",
-                language="go",
-                category="domain",
-                content="\n".join(domain_lines),
-            ),
-            GeneratedFile(
-                path="backend/internal/application/usecases.go",
-                language="go",
-                category="application",
-                content=usecase_go,
-            ),
-            GeneratedFile(
-                path="backend/cmd/api/main.go",
-                language="go",
-                category="adapter",
-                content=main_go,
-            ),
-        ]
+    @staticmethod
+    def _render_react_entity_table(ent: EntityDefinition) -> str:
+        headers = (
+            "\n              ".join(
+                f'<th className="px-4 py-2 text-left text-xs text-slate-400">{f.name}</th>'
+                for f in ent.fields
+            )
+            or '<th className="px-4 py-2">ID</th>'
+        )
+        cells = (
+            "\n                ".join(
+                f'<td className="px-4 py-2 text-sm font-mono">{{String(item.{f.name})}}</td>'
+                for f in ent.fields
+            )
+            or '<td className="px-4 py-2">{item.id}</td>'
+        )
 
-    def _generate_ts_hexagonal_stack(self, ir: ProjectIR) -> List[GeneratedFile]:
-        ts_type_map = {
-            DataTypePrimitive.STRING: "string",
-            DataTypePrimitive.INTEGER: "number",
-            DataTypePrimitive.FLOAT: "number",
-            DataTypePrimitive.DECIMAL: "number",
-            DataTypePrimitive.BOOLEAN: "boolean",
+        return (
+            'import React from "react";\n'
+            f'import type {{ {ent.name} }} from "../../types/domain";\n\n'
+            f"export function {ent.name}Table({{ items }}: {{ items: {ent.name}[] }}) {{\n"
+            "  return (\n"
+            '    <div className="rounded-xl border border-slate-800 bg-slate-900/60 overflow-hidden">\n'
+            '      <div className="px-4 py-3 border-b border-slate-800 flex justify-between">\n'
+            f'        <h2 className="text-sm font-semibold">{ent.name} Records</h2>\n'
+            '        <span className="text-xs text-slate-400">{items.length} items</span>\n'
+            "      </div>\n"
+            '      <table className="w-full border-collapse">\n'
+            "        <thead><tr>\n"
+            f"              {headers}\n"
+            "        </tr></thead>\n"
+            "        <tbody>\n"
+            "          {items.map((item, idx) => (\n"
+            '            <tr key={idx} className="border-t border-slate-800">\n'
+            f"                {cells}\n"
+            "            </tr>\n"
+            "          ))}\n"
+            "        </tbody>\n"
+            "      </table>\n"
+            "    </div>\n"
+            "  );\n"
+            "}\n"
+        )
+
+    @staticmethod
+    def _render_react_entity_card(ent: EntityDefinition) -> str:
+        rows = "\n        ".join(
+            f'<div className="flex justify-between text-xs"><span className="text-slate-400">{f.name}</span><span>{{String(data.{f.name})}}</span></div>'
+            for f in ent.fields
+        )
+        return (
+            'import React from "react";\n'
+            f'import type {{ {ent.name} }} from "../../types/domain";\n\n'
+            f"export function {ent.name}Card({{ data }}: {{ data: {ent.name} }}) {{\n"
+            "  return (\n"
+            '    <div className="p-4 rounded-xl border border-slate-800 bg-slate-900 space-y-2">\n'
+            f'      <h3 className="text-sm font-bold text-emerald-400">{ent.name}</h3>\n'
+            f'      <div className="space-y-1">{rows}</div>\n'
+            "    </div>\n"
+            "  );\n"
+            "}\n"
+        )
+
+    @staticmethod
+    def _render_react_dashboard_page(
+        project_name: str, entities: List[EntityDefinition], is_vite: bool = False
+    ) -> str:
+        rel_prefix = "./components" if is_vite else "../components"
+        imports = "\n".join(
+            f'import {{ {e.name}Table }} from "{rel_prefix}/domain/{e.name}Table";'
+            for e in entities
+        )
+        mounts = "\n        ".join(f"<{e.name}Table items={{[]}} />" for e in entities)
+        return (
+            'import React from "react";\n'
+            f'import {{ AppShell }} from "{rel_prefix}/layout/AppShell";\n'
+            f"{imports}\n\n"
+            "export default function DashboardPage() {\n"
+            "  return (\n"
+            f'    <AppShell title="{project_name} Workspace">\n'
+            '      <section className="space-y-6">\n'
+            f"        {mounts}\n"
+            "      </section>\n"
+            "    </AppShell>\n"
+            "  );\n"
+            "}\n"
+        )
+
+    @staticmethod
+    def _render_vue_entity_table(ent: EntityDefinition) -> str:
+        return (
+            '<script setup lang="ts">\n'
+            f'import type {{ {ent.name} }} from "../../types/domain";\n'
+            f"defineProps<{{ items: {ent.name}[] }}>();\n"
+            "</script>\n\n"
+            "<template>\n"
+            '  <div class="domain-table">\n'
+            f"    <h2>{ent.name} ({{ items.length }})</h2>\n"
+            "  </div>\n"
+            "</template>\n"
+        )
+
+    # ========================================================================
+    # ROOT INFRASTRUCTURE, PRUNING & ZIP PACKAGING
+    # ========================================================================
+
+    def _write_root_infrastructure_and_docs(
+        self,
+        root_dir: Path,
+        ir: ProjectIR,
+        backend_stack: TargetLanguage,
+        frontend_stack: TargetFrontend,
+        cli_log: List[str],
+    ) -> None:
+        # Backend Dockerfile
+        backend_dir = root_dir / "backend"
+        if backend_stack == TargetLanguage.GO_FIBER_OR_CHI:
+            b_docker = (
+                "FROM golang:1.23-alpine AS builder\nWORKDIR /app\nCOPY . .\n"
+                "RUN go build -o server ./cmd/api/main.go\n"
+                "FROM alpine:3.20\nWORKDIR /app\nCOPY --from=builder /app/server .\n"
+                'EXPOSE 8000\nCMD ["./server"]\n'
+            )
+        elif backend_stack == TargetLanguage.TYPESCRIPT_NEST_OR_NODE:
+            b_docker = (
+                "FROM node:22-alpine\nWORKDIR /app\nCOPY package*.json ./\n"
+                "RUN npm install\nCOPY . .\nEXPOSE 8000\n"
+                'CMD ["npm", "start"]\n'
+            )
+        else:
+            b_docker = (
+                "FROM python:3.13-slim\nWORKDIR /app\nCOPY requirements.txt .\n"
+                "RUN pip install --no-cache-dir -r requirements.txt\nCOPY . .\n"
+                'EXPOSE 8000\nCMD ["uvicorn", "src.adapters.api.main:app", "--host", "0.0.0.0", "--port", "8000"]\n'
+            )
+        (backend_dir / "Dockerfile").write_text(b_docker, encoding="utf-8")
+
+        fe_compose_block = ""
+        if frontend_stack != TargetFrontend.NONE:
+            fe_dir = root_dir / "frontend"
+            fe_dir.mkdir(parents=True, exist_ok=True)
+            (fe_dir / "Dockerfile").write_text(
+                "FROM node:22-alpine\nWORKDIR /app\nCOPY package*.json ./\n"
+                'RUN npm install\nCOPY . .\nEXPOSE 3000\nCMD ["npm", "run", "dev"]\n',
+                encoding="utf-8",
+            )
+            fe_compose_block = (
+                "  frontend:\n"
+                "    build: ./frontend\n"
+                '    ports:\n      - "3000:3000"\n'
+                "    environment:\n      - NEXT_PUBLIC_API_URL=http://localhost:8000\n"
+                "    depends_on:\n      - backend\n\n"
+            )
+
+        compose = (
+            "services:\n"
+            "  backend:\n"
+            "    build: ./backend\n"
+            '    ports:\n      - "8000:8000"\n'
+            "    environment:\n      - DATABASE_URL=postgresql://postgres:postgres@db:5432/kickstarter\n"
+            "    depends_on:\n      db:\n        condition: service_healthy\n\n"
+            f"{fe_compose_block}"
+            "  db:\n"
+            "    image: postgres:16-alpine\n"
+            "    environment:\n"
+            "      - POSTGRES_USER=postgres\n"
+            "      - POSTGRES_PASSWORD=postgres\n"
+            "      - POSTGRES_DB=kickstarter\n"
+            '    ports:\n      - "5432:5432"\n'
+            "    healthcheck:\n"
+            '      test: ["CMD-SHELL", "pg_isready -U postgres"]\n'
+            "      interval: 5s\n      timeout: 5s\n      retries: 5\n"
+        )
+        (root_dir / "docker-compose.yml").write_text(compose, encoding="utf-8")
+        (root_dir / ".gitignore").write_text(
+            "node_modules/\n.next/\ndist/\ntarget/\nbin/\nobj/\n__pycache__/\n.venv/\n.env\n",
+            encoding="utf-8",
+        )
+
+        cli_summary = "\n".join(f"- `{entry}`" for entry in cli_log)
+        rules_summary = "\n".join(
+            f"- **{r.title}** (`{r.id}`): {r.expected_behavior}"
+            for r in ir.business_rules
+        )
+        (root_dir / "AGENTS.md").write_text(
+            f"# {ir.project_name} — AI Agent Guide (AGENTS.md)\n\n"
+            f"## 1. Selected Stack\n"
+            f"- **Backend:** `{backend_stack.value}`\n"
+            f"- **Frontend:** `{frontend_stack.value}`\n\n"
+            f"## 2. CLI Bootstrapper Log\n{cli_summary}\n\n"
+            f"## 3. HITL-Verified Domain Rules\n{rules_summary or '- None'}\n",
+            encoding="utf-8",
+        )
+        (root_dir / "regen_blueprint.ir.json").write_text(
+            json.dumps(ir.model_dump(mode="json"), indent=2), encoding="utf-8"
+        )
+
+    def _prune_ignored_directories(self, root_dir: Path) -> None:
+        """Removes heavy dependency/VCS folders (.git, node_modules, target, bin, obj) just like GitHub."""
+        for dirpath, dirnames, _ in os.walk(root_dir, topdown=True):
+            for d in list(dirnames):
+                if d in IGNORE_DIRS:
+                    shutil.rmtree(Path(dirpath) / d, ignore_errors=True)
+                    dirnames.remove(d)
+
+    def _package_workspace(
+        self,
+        root_dir: Path,
+        ir: ProjectIR,
+        backend_stack: TargetLanguage,
+        frontend_stack: TargetFrontend,
+        pattern: str,
+        cli_log: List[str],
+    ) -> tuple[ScaffoldManifest, bytes]:
+        files_list: List[GeneratedFile] = []
+        zip_buffer = io.BytesIO()
+        slug = root_dir.name
+
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for file_path in sorted(root_dir.rglob("*")):
+                if not file_path.is_file():
+                    continue
+                if file_path.suffix.lower() in IGNORE_EXTENSIONS:
+                    continue
+
+                rel_path = file_path.relative_to(root_dir).as_posix()
+                zf.write(file_path, f"{slug}/{rel_path}")
+
+                # Read text files (<= 150 KB) into the frontend preview manifest
+                try:
+                    if file_path.stat().st_size <= 150_000:
+                        content = file_path.read_text(encoding="utf-8")
+                        files_list.append(
+                            GeneratedFile(
+                                path=rel_path,
+                                language=self._infer_language(file_path),
+                                category=self._infer_category(rel_path),
+                                content=content,
+                            )
+                        )
+                except UnicodeDecodeError:
+                    # Binary asset (like favicon.ico) stays in the ZIP, skipped in text viewer
+                    continue
+
+        zip_buffer.seek(0)
+        manifest = ScaffoldManifest(
+            project_id=ir.project_id,
+            project_name=ir.project_name,
+            chosen_stack=backend_stack,
+            chosen_frontend=frontend_stack,
+            chosen_pattern=pattern,
+            cli_commands_executed=cli_log,
+            total_files_generated=len(files_list),
+            files=files_list,
+        )
+        return manifest, zip_buffer.getvalue()
+
+    @staticmethod
+    def _infer_language(file_path: Path) -> str:
+        ext_map = {
+            ".py": "python",
+            ".go": "go",
+            ".ts": "typescript",
+            ".tsx": "typescript",
+            ".js": "javascript",
+            ".mjs": "javascript",
+            ".vue": "vue",
+            ".svelte": "svelte",
+            ".rs": "rust",
+            ".cs": "csharp",
+            ".json": "json",
+            ".yml": "yaml",
+            ".yaml": "yaml",
+            ".md": "markdown",
+            ".css": "css",
+            ".html": "html",
         }
-        entity_lines = ["// Strict Domain Entities generated by REGEN\n"]
-        for ent in ir.entities:
-            entity_lines.append(f"export interface {ent.name} {{")
-            for f in ent.fields:
-                ts_t = ts_type_map.get(f.data_type, "string")
-                opt = "" if f.is_required else "?"
-                entity_lines.append(f"  {f.name}{opt}: {ts_t};")
-            entity_lines.append("}\n")
+        return ext_map.get(file_path.suffix.lower(), "text")
 
-        return [
-            GeneratedFile(
-                path="backend/src/domain/entities.ts",
-                language="typescript",
-                category="domain",
-                content="\n".join(entity_lines),
-            ),
-            GeneratedFile(
-                path="backend/package.json",
-                language="json",
-                category="infrastructure",
-                content=json.dumps(
-                    {
-                        "name": f"{ir.project_name.lower()}-backend",
-                        "version": "1.0.0",
-                        "scripts": {"start": "node dist/main.js"},
-                    },
-                    indent=2,
-                ),
-            ),
-        ]
+    @staticmethod
+    def _infer_category(rel_path: str) -> str:
+        if rel_path.startswith("frontend/src/components"):
+            return "frontend-ui"
+        if rel_path.startswith("frontend/src/"):
+            return "frontend-data"
+        if rel_path.startswith("frontend/"):
+            return "frontend-config"
+        if "domain" in rel_path.lower():
+            return "domain"
+        if "ports" in rel_path.lower():
+            return "ports"
+        if "application" in rel_path.lower():
+            return "application"
+        if "tests" in rel_path.lower():
+            return "tests"
+        if rel_path.endswith(".md") or rel_path.endswith(".ir.json"):
+            return "docs"
+        return "infrastructure"
 
 
 scaffolder_engine = ScaffolderEngine()

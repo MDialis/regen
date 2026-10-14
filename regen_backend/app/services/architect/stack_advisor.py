@@ -1,12 +1,13 @@
-# app/services/architect/stack_advisor.py
 from typing import List, Optional, Tuple
 from app.domain.ir_schema import (
     ArchitecturalPattern,
     ArchitectureDecision,
     ProjectIR,
+    TargetFrontend,
     TargetLanguage,
     TechnicalConstraints,
 )
+
 from app.domain.wizard_state import StackScoreBreakdown
 
 
@@ -17,11 +18,13 @@ class StackAdvisorService:
     an architecture and tech stack.
     """
 
+    # Inside StackAdvisorService.evaluate_and_recommend:
     def evaluate_and_recommend(
         self,
         ir: ProjectIR,
         constraints: TechnicalConstraints,
         override_language: Optional[TargetLanguage] = None,
+        override_frontend: Optional[TargetFrontend] = None,
     ) -> Tuple[ArchitectureDecision, List[StackScoreBreakdown]]:
         ir.technical_constraints = constraints
         pattern = self._select_architectural_pattern(ir, constraints)
@@ -33,11 +36,8 @@ class StackAdvisorService:
             self._score_csharp(constraints, pattern),
             self._score_rust(constraints, pattern),
         ]
-
-        # Sort descending by total_score
         candidates.sort(key=lambda c: c.total_score, reverse=True)
 
-        # Pick top candidate or honor explicit user override
         winning_candidate = candidates[0]
         if override_language:
             for cand in candidates:
@@ -45,19 +45,32 @@ class StackAdvisorService:
                     winning_candidate = cand
                     break
 
+        # Determine Frontend Stack independently
+        chosen_fe = (
+            override_frontend
+            or constraints.preferred_frontend
+            or (
+                TargetFrontend.NEXTJS
+                if constraints.require_frontend
+                else TargetFrontend.NONE
+            )
+        )
+        if not constraints.require_frontend and override_frontend is None:
+            chosen_fe = TargetFrontend.NONE
+
         container_services = ["backend", "db"]
-        if constraints.require_frontend or len(ir.ui_views) > 0:
+        if chosen_fe != TargetFrontend.NONE:
             container_services.append("frontend")
 
         decision = ArchitectureDecision(
             chosen_backend_language=winning_candidate.language,
             chosen_pattern=winning_candidate.recommended_pattern,
             chosen_database=constraints.database_preference,
-            chosen_frontend_stack=(
-                "nextjs_shadcn" if "frontend" in container_services else None
-            ),
+            chosen_frontend_stack=chosen_fe,
             ai_friendliness_score=winning_candidate.ai_friendliness_score,
-            rationale=self._build_rationale(winning_candidate, constraints, ir),
+            rationale=self._build_rationale(
+                winning_candidate, chosen_fe, constraints, ir
+            ),
             container_services=container_services,
         )
 
@@ -206,15 +219,16 @@ class StackAdvisorService:
 
     @staticmethod
     def _build_rationale(
-        winner: StackScoreBreakdown, c: TechnicalConstraints, ir: ProjectIR
+        winner: StackScoreBreakdown,
+        chosen_fe: TargetFrontend,
+        c: TechnicalConstraints,
+        ir: ProjectIR,
     ) -> str:
         return (
-            f"Selected `{winner.language.value}` with `{winner.recommended_pattern.value}` "
-            f"architecture (Total Score: {winner.total_score}/100, AI-Friendliness: "
-            f"{winner.ai_friendliness_score}/100). Optimized for {c.expected_concurrency_rps} RPS "
-            f"({'I/O-bound' if c.io_heavy else 'mixed'} workload, "
-            f"{'CPU-intensive' if c.cpu_heavy else 'standard CPU'}) across "
-            f"{len(ir.entities)} entities and {len(ir.business_rules)} business rules."
+            f"Backend: `{winner.language.value}` ({winner.recommended_pattern.value}) | "
+            f"Frontend: `{chosen_fe.value}` (Score: {winner.total_score}/100, AI-Friendliness: "
+            f"{winner.ai_friendliness_score}/100). Tuned for {c.expected_concurrency_rps} RPS "
+            f"across {len(ir.entities)} entities and {len(ir.business_rules)} business rules."
         )
 
 

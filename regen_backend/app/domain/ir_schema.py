@@ -60,6 +60,15 @@ class TargetLanguage(str, Enum):
     CSHARP_DOTNET = "csharp_dotnet"
 
 
+class TargetFrontend(str, Enum):
+    NEXTJS = "nextjs"
+    REACT_VITE = "react_vite"
+    VUE_VITE = "vue_vite"
+    SVELTEKIT = "sveltekit"
+    ANGULAR = "angular"
+    NONE = "none"
+
+
 class AmbiguityStatus(str, Enum):
     UNRESOLVED = "unresolved"  # Blocks scaffolding until user answers
     RESOLVED = "resolved"  # Clarified via HITL Wizard
@@ -233,6 +242,7 @@ class TechnicalConstraints(BaseModel):
     """User-defined constraints gathered during the Phase 3 Wizard."""
 
     preferred_languages: List[TargetLanguage] = Field(default_factory=list)
+    preferred_frontend: Optional[TargetFrontend] = None
     expected_concurrency_rps: int = Field(
         default=100, description="Requests per second"
     )
@@ -249,7 +259,7 @@ class ArchitectureDecision(BaseModel):
     chosen_backend_language: TargetLanguage
     chosen_pattern: ArchitecturalPattern
     chosen_database: str = "postgresql"
-    chosen_frontend_stack: Optional[str] = "nextjs_shadcn"
+    chosen_frontend_stack: TargetFrontend = TargetFrontend.NEXTJS
     ai_friendliness_score: int = Field(
         default=95,
         ge=0,

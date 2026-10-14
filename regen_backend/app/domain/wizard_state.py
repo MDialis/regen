@@ -7,6 +7,7 @@ from app.domain.ir_schema import (
     ArchitecturalPattern,
     ArchitectureDecision,
     ProjectIR,
+    TargetFrontend,
     TargetLanguage,
     TechnicalConstraints,
 )
@@ -44,7 +45,11 @@ class ArchitectRecommendationRequest(BaseModel):
     constraints: TechnicalConstraints
     override_language: Optional[TargetLanguage] = Field(
         default=None,
-        description="Optional explicit stack override chosen by the user",
+        description="Optional explicit backend stack override chosen by the user",
+    )
+    override_frontend: Optional[TargetFrontend] = Field(
+        default=None,
+        description="Optional explicit frontend framework chosen by the user",
     )
 
 

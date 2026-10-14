@@ -37,7 +37,9 @@ async def recommend_architecture_and_stack(
         ir=request.project_ir,
         constraints=request.constraints,
         override_language=request.override_language,
+        override_frontend=request.override_frontend,
     )
+
     return ArchitectRecommendationResponse(
         project_ir=request.project_ir,
         ready_for_scaffolding=request.project_ir.is_ready_for_scaffolding,
