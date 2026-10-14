@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.domain.ir_schema import ProjectIR
 from app.api.ingestion_router import router as ingestion_router
+from app.api.architect_router import router as architect_router
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -68,3 +69,4 @@ async def validate_project_ir(ir: ProjectIR) -> Dict[str, Any]:
 
 
 app.include_router(ingestion_router)
+app.include_router(architect_router)
