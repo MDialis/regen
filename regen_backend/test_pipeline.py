@@ -107,6 +107,41 @@ def run_e2e_pipeline_verification() -> None:
     )
     print(f"Rationale: {arch['rationale']}")
 
+    print("\n=== [STEP 6] Testing Phase 4 Guardrail (Reject Unresolved IR) ===")
+    r6_blocked = client.post("/api/v1/scaffolder/preview", json=ir)
+    assert r6_blocked.status_code == 422
+    print(
+        "Guardrail Passed! Unresolved IR properly rejected with 422:",
+        r6_blocked.json()["detail"],
+    )
+
+    print(
+        "\n=== [STEP 7] Testing Phase 4 & 5 Codebase Preview (/api/v1/scaffolder/preview) ==="
+    )
+    final_ir = rec_data["project_ir"]
+    r7 = client.post("/api/v1/scaffolder/preview", json=final_ir)
+    assert r7.status_code == 200
+    manifest = r7.json()
+    print(
+        f"Scaffolder Preview Passed! Generated {manifest['total_files_generated']} files for stack `{manifest['chosen_stack']}`:"
+    )
+    for f in manifest["files"]:
+        print(f"  - [{f['category'].upper()}] {f['path']} ({f['language']})")
+
+    print(
+        "\n=== [STEP 8] Testing Phase 4 Container ZIP Export (/api/v1/scaffolder/download-zip) ==="
+    )
+    r8 = client.post("/api/v1/scaffolder/download-zip", json=final_ir)
+    assert r8.status_code == 200
+    assert r8.headers["content-type"] == "application/zip"
+    print(f"ZIP Export Passed! Archive size: {len(r8.content)} bytes")
+
+    # Save the ZIP to disk inside regen_backend
+    output_zip = "legacybillingapp_kickstarter.zip"
+    with open(output_zip, "wb") as f:
+        f.write(r8.content)
+    print(f"Saved archive to: {output_zip}")
+
 
 if __name__ == "__main__":
     run_e2e_pipeline_verification()
