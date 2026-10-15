@@ -1,22 +1,27 @@
 # app/services/ingestion/pipeline.py
-from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 from pydantic import BaseModel, Field
 
 from app.domain.ir_schema import (
-    IngestionMetrics,
     ProjectIR,
     SourceModality,
     SourceReference,
     UIViewComponent,
 )
 from app.services.ingestion.ast_analyzer import ComplexCodeChunk, ast_analyzer
+from app.services.ingestion.doc_processor import doc_processor
 from app.services.ingestion.llm_extractor import llm_extractor
 
 
 class CodeFileInput(BaseModel):
     file_path: str = Field(..., examples=["legacy_billing.py"])
     content: str
+
+
+class DocumentFileInput(BaseModel):
+    file_path: str = Field(..., examples=["requirements.csv", "spec.pdf"])
+    text_content: Optional[str] = None
+    base64_content: Optional[str] = None
 
 
 class ScreenshotInput(BaseModel):
@@ -31,28 +36,30 @@ class ScreenshotInput(BaseModel):
 class IngestionRequest(BaseModel):
     project_name: str = Field(..., examples=["BillingModernization"])
     code_files: List[CodeFileInput] = Field(default_factory=list)
-    plain_text_requirements: Optional[str] = Field(
-        default=None,
-        examples=[
-            "- Invoices above $10,000 require dual manager approval.\n"
-            "- All legacy tax codes must support multi-currency."
-        ],
-    )
+    document_files: List[DocumentFileInput] = Field(default_factory=list)
+    plain_text_requirements: Optional[str] = Field(default=None)
     screenshots: List[ScreenshotInput] = Field(default_factory=list)
+    low_vram_mode: Optional[bool] = Field(
+        default=None,
+        description="If True, forces phi4-mini for all local LLM tasks",
+    )
 
 
 class IngestionPipeline:
     """
-    Phase 1 & Phase 2 Bridge:
-    Ingests multi-modal legacy inputs, runs deterministic AST gatekeeping,
-    routes complex chunks to the LLM/heuristic extractor, and outputs a ProjectIR.
+    3-Stage Hybrid Ingestion Pipeline:
+    1. Code files -> Deterministic `tree-sitter` AST parser.
+    2. Non-code files (.csv, .xlsx, .pdf, .json, .md) -> Deterministic Python `doc_processor`.
+    3. Condensed digests + Plain Text -> Local LLM (`phi4-mini`) to infer missing Entities,
+       Routes, Business Rules, HITL questions, and pre-filled TechnicalConstraints.
     """
 
     async def run(self, payload: IngestionRequest) -> ProjectIR:
         ir = ProjectIR(project_name=payload.project_name)
         all_complex_chunks: List[ComplexCodeChunk] = []
+        doc_summaries: List[str] = []
 
-        # 1. Modality A: Legacy Codebase (Deterministic AST + Complexity Gatekeeper)
+        # 1. Legacy Code Files -> tree-sitter AST
         for code_file in payload.code_files:
             ast_res = ast_analyzer.analyze_file(code_file.file_path, code_file.content)
             ir.entities.extend(ast_res.entities)
@@ -68,22 +75,58 @@ class IngestionPipeline:
 
         ir.ingestion_metrics.complex_chunks_sent_to_llm = len(all_complex_chunks)
 
-        # Extract Business Rules & HITL Ambiguities from complex AST chunks
         if all_complex_chunks:
             extracted_rules, hitl_questions = (
-                await llm_extractor.extract_from_complex_chunks(all_complex_chunks)
+                await llm_extractor.extract_from_complex_chunks(
+                    all_complex_chunks, low_vram_mode=payload.low_vram_mode
+                )
             )
             ir.business_rules.extend(extracted_rules)
             ir.hitl_questions.extend(hitl_questions)
 
-        # 2. Modality B: Plain Text Requirements
-        if payload.plain_text_requirements:
-            text_rules = llm_extractor.extract_from_plain_text(
-                payload.plain_text_requirements
+        # 2. Non-Code Document Files (.csv, .xlsx, .pdf, .json, .md, .txt) -> Python Pre-Processor
+        for doc in payload.document_files:
+            doc_res = doc_processor.process_file(
+                file_path=doc.file_path,
+                text_content=doc.text_content,
+                base64_content=doc.base64_content,
             )
-            ir.business_rules.extend(text_rules)
+            ir.entities.extend(doc_res.inferred_entities)
+            if doc_res.condensed_summary_for_llm:
+                doc_summaries.append(doc_res.condensed_summary_for_llm)
 
-        # 3. Modality C: Visual Inputs (Screenshots -> UIViewComponents)
+            ir.ingestion_metrics.total_files_scanned += 1
+            ir.ingestion_metrics.ast_nodes_parsed_deterministically += len(
+                doc_res.inferred_entities
+            )
+            ir.ingestion_metrics.estimated_tokens_saved += doc_res.tokens_saved
+            ir.ingestion_metrics.llm_tokens_consumed += doc_res.condensed_tokens_count
+
+        # 3. Plain-Text Requirements + Condensed Document Summaries -> Local LLM (`phi4-mini`)
+        if (
+            payload.plain_text_requirements and payload.plain_text_requirements.strip()
+        ) or doc_summaries:
+            existing_names = [e.name for e in ir.entities]
+            (
+                inferred_entities,
+                inferred_routes,
+                inferred_rules,
+                inferred_questions,
+                inferred_constraints,
+            ) = await llm_extractor.analyze_documents_and_text(
+                project_name=payload.project_name,
+                plain_text=payload.plain_text_requirements or "",
+                doc_summaries=doc_summaries,
+                existing_entity_names=existing_names,
+                low_vram_mode=payload.low_vram_mode,
+            )
+            ir.entities.extend(inferred_entities)
+            ir.routes.extend(inferred_routes)
+            ir.business_rules.extend(inferred_rules)
+            ir.hitl_questions.extend(inferred_questions)
+            ir.technical_constraints = inferred_constraints
+
+        # 4. Visual Inputs (Screenshots)
         for shot in payload.screenshots:
             ir.ui_views.append(
                 UIViewComponent(
