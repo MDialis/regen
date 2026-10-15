@@ -1,6 +1,6 @@
-// src/lib/api.ts
 import {
   ArchitectRecommendationResponse,
+  DocUploadItem,
   ProjectIR,
   ScaffoldJobStatus,
   TargetFrontend,
@@ -14,7 +14,9 @@ const API_BASE =
 export async function analyzeInputs(payload: {
   project_name: string;
   code_files: { file_path: string; content: string }[];
+  document_files?: DocUploadItem[];
   plain_text_requirements?: string;
+  low_vram_mode?: boolean;
 }): Promise<ProjectIR> {
   const res = await fetch(`${API_BASE}/ingestion/analyze`, {
     method: "POST",
@@ -83,6 +85,5 @@ export async function pollScaffoldJob(
 }
 
 export function triggerInstantJobZipDownload(jobId: string): void {
-  // Hits the pre-built in-memory ZIP endpoint directly for an instant browser download
   window.location.href = `${API_BASE}/scaffolder/jobs/${jobId}/download`;
 }
