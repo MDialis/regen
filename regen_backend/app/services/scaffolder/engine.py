@@ -80,6 +80,24 @@ class ScaffolderEngine:
                 "and run the Stack Advisor first."
             )
 
+        # ====================================================================
+        # GLOBAL DEDUPLICATION: Prevent compiler/import errors across all layers
+        # ====================================================================
+
+        # Deduplicate Entities by Name
+        unique_entities = {e.name: e for e in ir.entities}
+        ir.entities = list(unique_entities.values())
+
+        # Deduplicate Routes by Method + Path (e.g., "GET_/invoices")
+        unique_routes = {f"{r.method.value}_{r.path}": r for r in ir.routes}
+        ir.routes = list(unique_routes.values())
+
+        # Deduplicate Business Rules by ID
+        unique_rules = {r.id: r for r in ir.business_rules}
+        ir.business_rules = list(unique_rules.values())
+
+        # ====================================================================
+
         def report(step_msg: str, pct: int) -> None:
             if on_progress:
                 on_progress(step_msg, pct)
@@ -978,20 +996,20 @@ class ScaffolderEngine:
         backend_dir = root_dir / "backend"
         if backend_stack == TargetLanguage.GO_FIBER_OR_CHI:
             b_docker = (
-                "FROM golang:1.23-alpine AS builder\nWORKDIR /app\nCOPY . .\n"
+                "FROM golang:alpine AS builder\nWORKDIR /app\nCOPY . .\n"
                 "RUN go build -o server ./cmd/api/main.go\n"
-                "FROM alpine:3.20\nWORKDIR /app\nCOPY --from=builder /app/server .\n"
+                "FROM alpine:latest\nWORKDIR /app\nCOPY --from=builder /app/server .\n"
                 'EXPOSE 8000\nCMD ["./server"]\n'
             )
         elif backend_stack == TargetLanguage.TYPESCRIPT_NEST_OR_NODE:
             b_docker = (
-                "FROM node:22-alpine\nWORKDIR /app\nCOPY package*.json ./\n"
+                "FROM node:alpine\nWORKDIR /app\nCOPY package*.json ./\n"
                 "RUN npm install\nCOPY . .\nEXPOSE 8000\n"
                 'CMD ["npm", "start"]\n'
             )
         else:
             b_docker = (
-                "FROM python:3.13-slim\nWORKDIR /app\nCOPY requirements.txt .\n"
+                "FROM python:slim\nWORKDIR /app\nCOPY requirements.txt .\n"
                 "RUN pip install --no-cache-dir -r requirements.txt\nCOPY . .\n"
                 'EXPOSE 8000\nCMD ["uvicorn", "src.adapters.api.main:app", "--host", "0.0.0.0", "--port", "8000"]\n'
             )
@@ -1002,7 +1020,7 @@ class ScaffolderEngine:
             fe_dir = root_dir / "frontend"
             fe_dir.mkdir(parents=True, exist_ok=True)
             (fe_dir / "Dockerfile").write_text(
-                "FROM node:22-alpine\nWORKDIR /app\nCOPY package*.json ./\n"
+                "FROM node:alpine\nWORKDIR /app\nCOPY package*.json ./\n"
                 'RUN npm install\nCOPY . .\nEXPOSE 3000\nCMD ["npm", "run", "dev"]\n',
                 encoding="utf-8",
             )
@@ -1023,7 +1041,7 @@ class ScaffolderEngine:
             "    depends_on:\n      db:\n        condition: service_healthy\n\n"
             f"{fe_compose_block}"
             "  db:\n"
-            "    image: postgres:16-alpine\n"
+            "    image: postgres:alpine\n"
             "    environment:\n"
             "      - POSTGRES_USER=postgres\n"
             "      - POSTGRES_PASSWORD=postgres\n"
