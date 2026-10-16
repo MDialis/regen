@@ -85,9 +85,17 @@ export interface TechnicalConstraints {
   expected_concurrency_rps: number;
   io_heavy: boolean;
   cpu_heavy: boolean;
+  will_use_ai_coding_assistants: boolean;
   database_preference: string;
   require_frontend: boolean;
   team_experience_notes?: string | null;
+}
+
+export interface AHPWeightsBreakdown {
+  velocity_weight: number;
+  performance_weight: number;
+  ecosystem_weight: number;
+  ai_weight: number;
 }
 
 export interface ArchitectureDecision {
@@ -131,17 +139,38 @@ export interface StackScoreBreakdown {
   language: TargetLanguage;
   recommended_pattern: ArchitecturalPattern;
   total_score: number;
-  ai_friendliness_score: number;
+  base_industry_score: number;
+  familiarity_modifier: number;
+  proximity_modifier: number;
+  velocity_score: number;
   performance_fit_score: number;
+  ecosystem_score: number;
+  ai_friendliness_score: number;
   pros: string[];
   tradeoffs: string[];
+}
+
+export interface FrontendScoreBreakdown {
+  framework: TargetFrontend;
+  total_score: number;
+  base_industry_score: number;
+  familiarity_modifier: number;
+  proximity_modifier: number;
+  seo_ssr_score: number;
+  interactivity_spa_score: number;
+  ecosystem_score: number;
+  ai_friendliness_score: number;
+  rationale: string;
 }
 
 export interface ArchitectRecommendationResponse {
   project_ir: ProjectIR;
   ready_for_scaffolding: boolean;
   selected_architecture: ArchitectureDecision;
+  ahp_weights: AHPWeightsBreakdown;
   ranked_alternatives: StackScoreBreakdown[];
+  ranked_frontend_alternatives: FrontendScoreBreakdown[];
+  benchmark_sources: Record<string, string>;
 }
 
 export interface GeneratedFile {

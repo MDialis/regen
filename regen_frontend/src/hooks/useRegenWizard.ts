@@ -51,17 +51,20 @@ export function useRegenWizard() {
   // Step 3 State
   const [constraints, setConstraints] = useState<TechnicalConstraints>({
     preferred_languages: [],
-    preferred_frontend: "nextjs",
+    preferred_frontend: null,
     expected_concurrency_rps: 200,
     io_heavy: true,
     cpu_heavy: false,
+    will_use_ai_coding_assistants: true,
     database_preference: "postgresql",
     require_frontend: true,
     team_experience_notes: "",
   });
+
   const [overrideLang, setOverrideLang] = useState<TargetLanguage | "">("");
-  const [selectedFrontend, setSelectedFrontend] =
-    useState<TargetFrontend>("nextjs");
+  const [selectedFrontend, setSelectedFrontend] = useState<TargetFrontend | "">(
+    "",
+  );
   const [archRec, setArchRec] =
     useState<ArchitectRecommendationResponse | null>(null);
 
@@ -208,9 +211,13 @@ export function useRegenWizard() {
     setError(null);
     try {
       const chosenBe = overrideLang ? (overrideLang as TargetLanguage) : null;
+      const chosenFe = selectedFrontend
+        ? (selectedFrontend as TargetFrontend)
+        : null;
+
       const updatedConstraints: TechnicalConstraints = {
         ...constraints,
-        preferred_frontend: selectedFrontend,
+        preferred_frontend: chosenFe,
         require_frontend: selectedFrontend !== "none",
       };
 
@@ -218,7 +225,7 @@ export function useRegenWizard() {
         projectIR,
         updatedConstraints,
         chosenBe,
-        selectedFrontend,
+        chosenFe,
       );
       setProjectIR(rec.project_ir);
       setArchRec(rec);
