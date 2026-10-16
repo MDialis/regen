@@ -1,4 +1,4 @@
-# app/services/scaffolder/engine.py
+import re
 import io
 import json
 import os
@@ -69,6 +69,151 @@ class ScaffolderEngine:
     4. Packages both a browsable ScaffoldManifest and a pre-built ZIP byte stream.
     """
 
+    _RESERVED_KEYWORDS = {
+        "class",
+        "struct",
+        "interface",
+        "enum",
+        "record",
+        "namespace",
+        "using",
+        "public",
+        "private",
+        "protected",
+        "internal",
+        "static",
+        "void",
+        "int",
+        "string",
+        "bool",
+        "float",
+        "double",
+        "decimal",
+        "object",
+        "event",
+        "delegate",
+        "params",
+        "ref",
+        "out",
+        "in",
+        "is",
+        "as",
+        "base",
+        "this",
+        "new",
+        "override",
+        "virtual",
+        "abstract",
+        "sealed",
+        "readonly",
+        "const",
+        "try",
+        "catch",
+        "finally",
+        "throw",
+        "return",
+        "if",
+        "else",
+        "switch",
+        "case",
+        "default",
+        "for",
+        "foreach",
+        "while",
+        "do",
+        "break",
+        "continue",
+        "goto",
+        "lock",
+        "checked",
+        "unchecked",
+        "fixed",
+        "unsafe",
+        "operator",
+        "implicit",
+        "explicit",
+        "typeof",
+        "sizeof",
+        "stackalloc",
+        "volatile",
+        "extern",
+        "null",
+        "true",
+        "false",
+        "type",
+        "func",
+        "package",
+        "import",
+        "var",
+        "let",
+        "fn",
+        "mut",
+        "impl",
+        "trait",
+        "mod",
+        "pub",
+        "use",
+        "where",
+        "match",
+        "loop",
+        "move",
+        "async",
+        "await",
+        "yield",
+        "def",
+        "from",
+        "pass",
+        "global",
+        "nonlocal",
+        "lambda",
+        "with",
+        "del",
+        "assert",
+    }
+
+    @classmethod
+    def _sanitize_identifier(
+        cls, raw: str, pascal: bool = False, fallback: str = "field"
+    ) -> str:
+        """
+        Strips illegal characters ($, spaces, hyphens, quotes, dots) and escapes
+        language reserved keywords so generated C#, Go, Rust, Python, and TS always compile.
+        """
+        cleaned = re.sub(r"[^a-zA-Z0-9_]", "_", (raw or "").strip())
+        tokens = [t for t in cleaned.split("_") if t]
+        if not tokens:
+            tokens = [fallback]
+
+        if pascal:
+            ident = "".join(t[:1].upper() + t[1:] for t in tokens)
+        else:
+            ident = "_".join(t.lower() for t in tokens)
+
+        if ident[0].isdigit():
+            ident = f"{'Entity' if pascal else 'f_'}{ident}"
+
+        if ident.lower() in cls._RESERVED_KEYWORDS:
+            ident = f"{ident}{'Entity' if pascal else '_val'}"
+
+        return ident
+
+    def _sanitize_ir_identifiers(self, ir: ProjectIR) -> None:
+        """Cleans all Entity and Field names in-place before any code is generated."""
+        for idx, ent in enumerate(ir.entities, start=1):
+            ent.name = self._sanitize_identifier(
+                ent.name, pascal=True, fallback=f"Entity{idx}"
+            )
+            seen_fields: set[str] = set()
+            clean_fields = []
+            for f_idx, f in enumerate(ent.fields, start=1):
+                f.name = self._sanitize_identifier(
+                    f.name, pascal=False, fallback=f"field_{f_idx}"
+                )
+                if f.name not in seen_fields:
+                    seen_fields.add(f.name)
+                    clean_fields.append(f)
+            ent.fields = clean_fields
+
     def build_project_and_zip(
         self,
         ir: ProjectIR,
@@ -87,6 +232,9 @@ class ScaffolderEngine:
         # Deduplicate Entities by Name
         unique_entities = {e.name: e for e in ir.entities}
         ir.entities = list(unique_entities.values())
+
+        # Sanitize entity and field names across all layers
+        self._sanitize_ir_identifiers(ir)
 
         # Deduplicate Routes by Method + Path (e.g., "GET_/invoices")
         unique_routes = {f"{r.method.value}_{r.path}": r for r in ir.routes}
@@ -187,37 +335,51 @@ class ScaffolderEngine:
     # ========================================================================
 
     def _run_cli(
-        self, cmd: List[str], cwd: Path, cli_log: List[str], timeout_sec: int = 45
+        self, cmd: List[str], cwd: Path, cli_log: List[str], timeout_sec: int = 35
     ) -> bool:
         """
-        Executes a native CLI command cross-platform (Windows/Linux/macOS).
-        Uses CI=true to prevent interactive prompts.
+        Executes a native CLI command with stdin=DEVNULL so interactive CLIs
+        (like create-vite / clack prompts) never hang waiting for user input.
         """
         cmd_str = " ".join(cmd)
-        env = {**os.environ, "CI": "true", "NEXT_TELEMETRY_DISABLED": "1"}
-        use_shell = (
-            os.name == "nt"
-        )  # Needed on Windows to resolve .cmd shims like npx.cmd / npm.cmd
+        env = {
+            **os.environ,
+            "CI": "true",
+            "NEXT_TELEMETRY_DISABLED": "1",
+            " npm_config_yes": "true",
+            "NPM_CONFIG_YES": "true",
+        }
+        use_shell = os.name == "nt"
         try:
             proc = subprocess.run(
                 cmd_str if use_shell else cmd,
                 cwd=str(cwd),
                 env=env,
+                stdin=subprocess.DEVNULL,  # <-- CRITICAL: Prevents interactive CLI hangs!
                 shell=use_shell,
                 capture_output=True,
                 text=True,
                 timeout=timeout_sec,
                 check=False,
             )
-            if proc.returncode == 0:
+            if (
+                proc.returncode == 0
+                and (cwd / "frontend").exists()
+                or proc.returncode == 0
+            ):
                 cli_log.append(f"[OK] {cmd_str}")
                 return True
             cli_log.append(
                 f"[WARN: exit {proc.returncode}] {cmd_str} -> {(proc.stderr or proc.stdout)[:160].strip()}"
             )
             return False
+        except subprocess.TimeoutExpired:
+            cli_log.append(
+                f"[TIMEOUT after {timeout_sec}s - using fast fallback] {cmd_str}"
+            )
+            return False
         except Exception as exc:
-            cli_log.append(f"[SKIPPED - CLI not on PATH] {cmd_str} ({exc})")
+            cli_log.append(f"[SKIPPED - CLI error] {cmd_str} ({exc})")
             return False
 
     # ========================================================================
@@ -239,6 +401,13 @@ class ScaffolderEngine:
                 )
 
         elif stack == TargetLanguage.TYPESCRIPT_NEST_OR_NODE:
+            self._run_cli(
+                ["npm", "cache", "clean", "--force"],
+                backend_dir,
+                cli_log,
+                timeout_sec=20,
+            )
+
             ok = self._run_cli(["npm", "init", "-y"], backend_dir, cli_log)
             pkg_path = backend_dir / "package.json"
             pkg_data = (
@@ -360,7 +529,6 @@ class ScaffolderEngine:
                     "frontend",
                     "--ts",
                     "--tailwind",
-                    "--eslint",
                     "--app",
                     "--src-dir",
                     "--import-alias",
@@ -371,43 +539,45 @@ class ScaffolderEngine:
                 ],
                 root_dir,
                 cli_log,
-                timeout_sec=60,
+                timeout_sec=45,
             )
-            if not ok:
+            if not ok or not (fe_dir / "package.json").exists():
                 self._write_fallback_nextjs_base(fe_dir, slug)
 
         elif fe_stack == TargetFrontend.REACT_VITE:
             ok = self._run_cli(
                 [
-                    "npm",
-                    "create",
-                    "vite@latest",
+                    "npx",
+                    "--yes",
+                    "create-vite@latest",
                     "frontend",
-                    "--",
                     "--template",
                     "react-ts",
+                    "--no-interactive",
                 ],
                 root_dir,
                 cli_log,
+                timeout_sec=20,
             )
-            if not ok:
+            if not ok or not (fe_dir / "package.json").exists():
                 self._write_fallback_vite_base(fe_dir, slug, "react")
 
         elif fe_stack == TargetFrontend.VUE_VITE:
             ok = self._run_cli(
                 [
-                    "npm",
-                    "create",
-                    "vite@latest",
+                    "npx",
+                    "--yes",
+                    "create-vite@latest",
                     "frontend",
-                    "--",
                     "--template",
                     "vue-ts",
+                    "--no-interactive",
                 ],
                 root_dir,
                 cli_log,
+                timeout_sec=20,
             )
-            if not ok:
+            if not ok or not (fe_dir / "package.json").exists():
                 self._write_fallback_vite_base(fe_dir, slug, "vue")
 
         elif fe_stack == TargetFrontend.SVELTEKIT:
@@ -427,8 +597,9 @@ class ScaffolderEngine:
                 ],
                 root_dir,
                 cli_log,
+                timeout_sec=25,
             )
-            if not ok:
+            if not ok or not (fe_dir / "package.json").exists():
                 self._write_fallback_vite_base(fe_dir, slug, "sveltekit")
 
         elif fe_stack == TargetFrontend.ANGULAR:
@@ -447,9 +618,9 @@ class ScaffolderEngine:
                 ],
                 root_dir,
                 cli_log,
-                timeout_sec=60,
+                timeout_sec=45,
             )
-            if not ok:
+            if not ok or not (fe_dir / "package.json").exists():
                 self._write_fallback_vite_base(fe_dir, slug, "angular")
 
     def _overlay_frontend_architecture(
@@ -800,12 +971,32 @@ class ScaffolderEngine:
     ) -> None:
         dom = backend_dir / "Domain"
         dom.mkdir(parents=True, exist_ok=True)
-        lines = ["namespace KickStarterApi.Domain;\n"]
+        cs_type_map = {
+            DataTypePrimitive.STRING: "string",
+            DataTypePrimitive.INTEGER: "long",
+            DataTypePrimitive.FLOAT: "double",
+            DataTypePrimitive.DECIMAL: "decimal",
+            DataTypePrimitive.BOOLEAN: "bool",
+            DataTypePrimitive.DATETIME: "DateTime",
+            DataTypePrimitive.UUID: "Guid",
+            DataTypePrimitive.JSON: "object",
+        }
+        lines = ["using System;\n\nnamespace KickStarterApi.Domain;\n"]
         for ent in entities:
-            lines.append(f"public record {ent.name}(")
-            fields_cs = ", ".join(f"string {f.name}" for f in ent.fields) or "int Id"
-            lines.append(f"    {fields_cs}")
-            lines.append(");\n")
+            safe_ent_name = self._sanitize_identifier(
+                ent.name, pascal=True, fallback="DomainEntity"
+            )
+            props = []
+            for idx, f in enumerate(ent.fields, start=1):
+                cs_t = cs_type_map.get(f.data_type, "string")
+                prop_name = self._sanitize_identifier(
+                    f.name, pascal=True, fallback=f"Field{idx}"
+                )
+                if prop_name == safe_ent_name:
+                    prop_name = f"{prop_name}Value"
+                props.append(f"{cs_t} {prop_name}")
+            fields_cs = ", ".join(props) or "long Id"
+            lines.append(f"public record {safe_ent_name}({fields_cs});\n")
         (dom / "Entities.cs").write_text("\n".join(lines), encoding="utf-8")
 
     # ========================================================================
@@ -994,6 +1185,8 @@ class ScaffolderEngine:
     ) -> None:
         # Backend Dockerfile
         backend_dir = root_dir / "backend"
+        slug = root_dir.name.replace("_", "-")
+
         if backend_stack == TargetLanguage.GO_FIBER_OR_CHI:
             b_docker = (
                 "FROM golang:alpine AS builder\nWORKDIR /app\nCOPY . .\n"
@@ -1007,18 +1200,44 @@ class ScaffolderEngine:
                 "RUN npm install\nCOPY . .\nEXPOSE 8000\n"
                 'CMD ["npm", "start"]\n'
             )
+        elif backend_stack == TargetLanguage.CSHARP_DOTNET:
+            b_docker = (
+                "FROM mcr.microsoft.com/dotnet/sdk:8.0 AS builder\nWORKDIR /app\nCOPY . .\n"
+                "RUN dotnet publish -c Release -o out\n"
+                "FROM mcr.microsoft.com/dotnet/aspnet:8.0\nWORKDIR /app\n"
+                "COPY --from=builder /app/out .\nEXPOSE 8000\n"
+                "ENV ASPNETCORE_URLS=http://+:8000\n"
+                'CMD ["dotnet", "KickStarterApi.dll"]\n'
+            )
+        elif backend_stack == TargetLanguage.RUST_AXUM:
+            b_docker = (
+                "FROM rust:alpine AS builder\nWORKDIR /app\nCOPY . .\n"
+                "RUN apk add --no-cache musl-dev && cargo build --release\n"
+                "FROM alpine:latest\nWORKDIR /app\n"
+                f"COPY --from=builder /app/target/release/{slug} ./server\n"
+                'EXPOSE 8000\nCMD ["./server"]\n'
+            )
         else:
+            # Python FastAPI
             b_docker = (
                 "FROM python:slim\nWORKDIR /app\nCOPY requirements.txt .\n"
                 "RUN pip install --no-cache-dir -r requirements.txt\nCOPY . .\n"
                 'EXPOSE 8000\nCMD ["uvicorn", "src.adapters.api.main:app", "--host", "0.0.0.0", "--port", "8000"]\n'
             )
-        (backend_dir / "Dockerfile").write_text(b_docker, encoding="utf-8")
+
+        (backend_dir / ".dockerignore").write_text(
+            "node_modules\nbin\nobj\ntarget\n__pycache__\n.venv\n.git\n",
+            encoding="utf-8",
+        )
 
         fe_compose_block = ""
         if frontend_stack != TargetFrontend.NONE:
             fe_dir = root_dir / "frontend"
             fe_dir.mkdir(parents=True, exist_ok=True)
+            (root_dir / "frontend" / ".dockerignore").write_text(
+                "node_modules\n.next\ndist\n.git\n",
+                encoding="utf-8",
+            )
             (fe_dir / "Dockerfile").write_text(
                 "FROM node:alpine\nWORKDIR /app\nCOPY package*.json ./\n"
                 'RUN npm install\nCOPY . .\nEXPOSE 3000\nCMD ["npm", "run", "dev"]\n',

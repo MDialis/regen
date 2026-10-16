@@ -238,40 +238,69 @@ class CharacterizationContract(BaseModel):
 # ============================================================================
 
 
+class BenchmarkSourceCitation(BaseModel):
+    metric: str
+    source_name: str
+    url: str
+    summary: str
+
+
+class PriorityWeights(BaseModel):
+    """Dynamic AHP weights (sum to 1.0) inferred from project context or adjusted by user."""
+
+    velocity: float = Field(
+        default=0.35, ge=0.0, le=1.0, description="CRUD & MVP delivery speed"
+    )
+    performance: float = Field(
+        default=0.20, ge=0.0, le=1.0, description="High-concurrency & CPU throughput"
+    )
+    community: float = Field(
+        default=0.20, ge=0.0, le=1.0, description="Talent pool & ecosystem packages"
+    )
+    ai_friendliness: float = Field(
+        default=0.25, ge=0.0, le=1.0, description="AI coding assistant accuracy"
+    )
+
+
 class TechnicalConstraints(BaseModel):
     """User-defined constraints gathered during the Phase 3 Wizard."""
 
     preferred_languages: List[TargetLanguage] = Field(default_factory=list)
     preferred_frontend: Optional[TargetFrontend] = None
     expected_concurrency_rps: int = Field(
-        default=100, description="Requests per second"
+        default=200, description="Requests per second"
     )
     io_heavy: bool = True
     cpu_heavy: bool = False
+    needs_seo_ssr: bool = Field(
+        default=False,
+        description="If True, boosts SSR meta-frameworks (Next.js, SvelteKit) over SPAs",
+    )
+    will_use_ai_coding_assistants: bool = Field(
+        default=True,
+        description="Caps positive familiarity boost at +10 (vs +20) and negative penalty at -5 (vs -10)",
+    )
     database_preference: str = Field(default="postgresql")
     require_frontend: bool = True
     team_experience_notes: Optional[str] = None
+    priority_weights: Optional[PriorityWeights] = None
 
 
 class ArchitectureDecision(BaseModel):
-    """The Architect Engine's output explaining the chosen stack and structure."""
+    """The Architect Engine's output explaining the chosen backend + frontend stack and structure."""
 
     chosen_backend_language: TargetLanguage
     chosen_pattern: ArchitecturalPattern
     chosen_database: str = "postgresql"
     chosen_frontend_stack: TargetFrontend = TargetFrontend.NEXTJS
-    ai_friendliness_score: int = Field(
-        default=95,
-        ge=0,
-        le=100,
-        description="How easily future AI agents (Cursor/Copilot) can navigate this output",
-    )
+    ai_friendliness_score: int = Field(default=95, ge=0, le=100)
     rationale: str = Field(
-        ..., description="Why this stack/pattern fits the constraints"
+        ..., description="Why this backend + frontend stack fits the constraints"
     )
+    applied_priority_weights: PriorityWeights = Field(default_factory=PriorityWeights)
+    benchmark_sources: List[BenchmarkSourceCitation] = Field(default_factory=list)
     container_services: List[str] = Field(
-        default_factory=lambda: ["backend", "db", "frontend"],
-        description="Services to generate in docker-compose.yml",
+        default_factory=lambda: ["backend", "db", "frontend"]
     )
 
 
